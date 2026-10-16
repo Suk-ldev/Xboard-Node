@@ -33,7 +33,7 @@ WORKDIR /etc/xboard-node
 #     -e apiHost=https://panel.example.com \
 #     -e apiKey=YOUR_TOKEN \
 #     -e nodeID=1 \
-#     ghcr.io/cedar2025/xboard-node:latest
+#     ghcr.io/suk-ldev/xboard-node:latest
 #
 # Supported env vars:
 #   apiHost  / API_HOST    → panel URL
@@ -56,7 +56,7 @@ WORKDIR /etc/xboard-node
 # registered WARP device (a JSON file with private keys) survives restarts:
 #   docker run -d --network=host -v xboard-data:/etc/xboard-node \
 #     -e API_HOST=... -e API_KEY=... -e NODE_ID=1 -e WARP_MODE=all \
-#     ghcr.io/cedar2025/xboard-node:latest
+#     ghcr.io/suk-ldev/xboard-node:latest
 
 ENTRYPOINT ["xboard-node"]
 CMD ["-c", "/etc/xboard-node/config.yml"]
