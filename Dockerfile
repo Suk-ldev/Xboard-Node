@@ -45,6 +45,18 @@ WORKDIR /etc/xboard-node
 #   certFile / CERT_FILE   → TLS cert path
 #   keyFile  / KEY_FILE    → TLS key path
 #   logLevel / LOG_LEVEL   → log level
+#
+# Cloudflare WARP egress (node mode only):
+#   WARP_MODE         all | v6 | off (default off)
+#   WARP_LICENSE_KEY  optional WARP+ subscription key
+#   WARP_ENDPOINT     optional comma-separated ingress overrides
+#   WARP_STATE_DIR    optional, default /etc/xboard-node/warp
+#
+# When WARP_MODE is enabled, mount a volume at /etc/xboard-node so the
+# registered WARP device (a JSON file with private keys) survives restarts:
+#   docker run -d --network=host -v xboard-data:/etc/xboard-node \
+#     -e API_HOST=... -e API_KEY=... -e NODE_ID=1 -e WARP_MODE=all \
+#     ghcr.io/cedar2025/xboard-node:latest
 
 ENTRYPOINT ["xboard-node"]
 CMD ["-c", "/etc/xboard-node/config.yml"]

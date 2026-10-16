@@ -26,6 +26,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/monitor"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/tracker"
+	"github.com/cedar2025/xboard-node/internal/warp"
 )
 
 type Service struct {
@@ -37,6 +38,7 @@ type Service struct {
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
 	cert         *cert.Manager
+	warp         *warp.Manager
 
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
@@ -153,6 +155,11 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
 
+	var warpMgr *warp.Manager
+	if cfg.Warp.Enabled() {
+		warpMgr, _ = warp.NewManager(cfg.Warp, cfg.Kernel.ConfigDir, cfg.Panel.NodeID)
+	}
+
 	return &Service{
 		cfg:          cfg,
 		source:       cp,
@@ -162,6 +169,7 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		limiter:      l,
 		speedTracker: st,
 		cert:         certMgr,
+		warp:         warpMgr,
 		wsEvents:     make(chan controlplane.Event, 16),
 		wsStatusCh:   make(chan controlplane.StatusChange, 4),
 		pullResults:  make(chan pullResult, 1),
@@ -169,6 +177,35 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	// Prepare WARP egress (register/load account) before anything else. The
+	// account must exist before the kernel's first Start because it becomes
+	// part of the generated kernel config. Failures are fatal: silently
+	// falling back to direct egress would leak the server's real IP, which
+	// is precisely what WARP mode is meant to prevent.
+	if s.cfg.Warp.Enabled() {
+		if s.warp == nil {
+			mgr, err := warp.NewManager(s.cfg.Warp, s.cfg.Kernel.ConfigDir, s.cfg.Panel.NodeID)
+			if err != nil {
+				return fmt.Errorf("warp manager: %w", err)
+			}
+			s.warp = mgr
+		}
+		acc, err := s.warp.Ensure(ctx)
+		if err != nil {
+			return fmt.Errorf("warp: %w", err)
+		}
+		switch k := s.kernel.(type) {
+		case *singbox.SingBox:
+			k.SetWarpAccount(acc)
+		case *xray.Xray:
+			k.SetWarpAccount(acc)
+		}
+		nlog.Core().Info("warp egress enabled",
+			"mode", s.cfg.Warp.Mode,
+			"device_id", acc.DeviceID,
+		)
+	}
+
 	// Start cert manager (handles auto-TLS or manual cert verification)
 	if err := s.cert.Start(ctx); err != nil {
 		return fmt.Errorf("cert manager: %w", err)

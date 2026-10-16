@@ -22,6 +22,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/warp"
 )
 
 // drainTimeout is how long stop() waits for in-flight connections to finish
@@ -35,6 +36,8 @@ const drainTimeout = 5 * time.Second
 // restarting listeners — zero connection disruption.
 type SingBox struct {
 	cfg config.KernelConfig
+	// warp is the WARP egress account, set before Start when warp is enabled.
+	warp *warp.Account
 
 	mu     sync.RWMutex
 	box    *box.Box
@@ -67,6 +70,27 @@ func New(cfg config.KernelConfig) *SingBox {
 	return &SingBox{cfg: cfg}
 }
 
+// SetWarpAccount injects the WARP egress account before Start/Reload. It must
+// be called before the first Start (Service owns the lifecycle).
+func (s *SingBox) SetWarpAccount(acc *warp.Account) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.warp = acc
+}
+
+// warpModeName returns the routing mode implied by the account ("all": WARP
+// carries everything; "v6": WARP only carries IPv6). Non-WARP builds use
+// "all" — the value is ignored when the account is nil.
+func warpModeName(acc *warp.Account) string {
+	if acc == nil {
+		return "all"
+	}
+	if !acc.HasV4() {
+		return "v6"
+	}
+	return "all"
+}
+
 var _ kernel.Kernel = (*SingBox)(nil)
 
 func (s *SingBox) Name() string { return "sing-box" }
@@ -93,7 +117,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
+	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls, s.warp, warpModeName(s.warp))
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -200,7 +224,7 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		return fmt.Errorf("not running")
 	}
 
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls)
+	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls, s.warp, warpModeName(s.warp))
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -522,7 +546,7 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 // reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
 // Must be called with s.mu held.
 func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
-	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.tls)
+	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.tls, s.warp, warpModeName(s.warp))
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)

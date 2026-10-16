@@ -32,3 +32,5 @@ internal/tracker/tracker_bench_test.go
 cmd/xboard-node-bench-compare
 cmd/xboard-node-bench
 .env
+# WARP account state (contains private keys) — never commit
+data/

@@ -24,3 +24,31 @@
 #       token: "machine-token-2"
 #     log:
 #       level: "debug"   # override for this instance only
+
+# ── Cloudflare WARP egress ──
+# Route node egress traffic through a userspace WireGuard tunnel to
+# Cloudflare WARP. Node mode only (rejected in machine mode).
+#
+#   mode: "off"   direct egress (default)
+#   mode: "all"   every destination goes through WARP
+#   mode: "v6"    only IPv6 destinations go through WARP (IPv4 stays direct)
+#                 — useful on IPv4-only servers; the free WARP account
+#                 includes an IPv6 tunnel address
+#
+# Account state is stored per node under state_dir (default
+# <config_dir>/warp/node-<id>.json). Keep it on a persistent volume: the
+# device is reused across restarts instead of re-registering, and
+# registration from datacenter IPs is frequently rate-limited by Cloudflare.
+#
+# warp:
+#   mode: "all"
+#   license_key: ""              # optional, WARP+ subscription key
+#   endpoints: ""                # optional comma-separated ingress overrides
+#                                # e.g. "162.159.192.1:2408,162.159.193.1:2408"
+#   state_dir: ""                # default <config_dir>/warp
+#   account_file: ""             # import an existing account JSON instead
+#                                # of registering a new device
+#   register_timeout: 30         # seconds per registration attempt
+#
+# Equivalent environment variables (no config file needed):
+#   WARP_MODE, WARP_LICENSE_KEY, WARP_ENDPOINT, WARP_STATE_DIR

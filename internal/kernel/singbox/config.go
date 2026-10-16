@@ -12,19 +12,35 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/warp"
 	"github.com/go-viper/mapstructure/v2"
 )
 
 // M is a shorthand for building JSON-like maps
 type M = map[string]interface{}
 
-func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert, warpAcc *warp.Account, warpMode string) M {
 	var outbounds []M
+	var endpoints []M
 	tags := make(map[string]bool)
+
+	// WARP egress endpoint (userspace WireGuard; registered before Start).
+	warpTag := ""
+	if warpAcc != nil {
+		warpTag = "warp"
+		endpoints = append(endpoints, warpEndpointConfig(warpAcc))
+	}
 
 	// Panel-defined custom outbounds (structured, converted to sing-box native)
 	for _, co := range nc.CustomOutbounds {
-		outbounds = append(outbounds, outboundConfigToSingbox(co))
+		converted, ep := outboundConfigToSingbox(co)
+		if ep != nil {
+			// sing-box 1.13+ removed the wireguard outbound; panel-defined
+			// wireguard outbounds become endpoints instead.
+			endpoints = append(endpoints, ep)
+		} else {
+			outbounds = append(outbounds, converted)
+		}
 		tags[strings.ToLower(co.Tag)] = true
 	}
 
@@ -33,6 +49,11 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		tag, _ := co["tag"].(string)
 		if tag != "" {
 			tags[strings.ToLower(tag)] = true
+		}
+		if proto, _ := co["type"].(string); proto == "wireguard" {
+			// Legacy wireguard outbound in local config: promote to endpoint.
+			endpoints = append(endpoints, co)
+			continue
 		}
 		outbounds = append(outbounds, M(co))
 	}
@@ -52,6 +73,9 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		},
 		"outbounds": outbounds,
 	}
+	if len(endpoints) > 0 {
+		cfg["endpoints"] = endpoints
+	}
 
 	inbound := buildInbound(nc, users, tc)
 	if inbound != nil {
@@ -59,7 +83,18 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	}
 
 	// Merge panel routes and static config routes
-	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
+	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute), warpTag, warpMode)
+
+	// The resolve action added for WARP needs a DNS server; give one when the
+	// operator (or panel custom config) hasn't defined any. Local DNS follows
+	// the system resolver, which is fine inside a container.
+	if warpTag != "" {
+		if _, hasDNS := cfg["dns"]; !hasDNS {
+			cfg["dns"] = M{
+				"servers": []M{{"type": "local", "tag": "local"}},
+			}
+		}
+	}
 
 	// Automatically enable rule_set caching (cache_file) when panel routes
 	// reference geoip:/geosite: entries so that the downloaded .srs rule_set
@@ -77,10 +112,39 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	return cfg
 }
 
+// warpEndpointConfig builds the sing-box WireGuard endpoint object for the
+// WARP account. Only the account's address families are enabled so a v6-only
+// tunnel doesn't get v4 traffic it can't carry.
+func warpEndpointConfig(acc *warp.Account) M {
+	endpoint := M{
+		"type":        "wireguard",
+		"tag":         "warp",
+		"mtu":         1280,
+		"address":     acc.AddressList(),
+		"private_key": acc.PrivateKey,
+		"peers": []M{{
+			"address":              "162.159.192.1",
+			"port":                 2408,
+			"public_key":           acc.PeerKey,
+			"allowed_ips":          []string{"0.0.0.0/0", "::/0"},
+			"persistent_keepalive_interval": 25,
+		}},
+	}
+	if r := acc.Reserved; r != [3]byte{} {
+		endpoint["peers"].([]M)[0]["reserved"] = []uint8{r[0], r[1], r[2]}
+	}
+	return endpoint
+}
+
 // outboundConfigToSingbox converts a structured OutboundConfig (from the panel)
 // into a sing-box outbound object. sing-box uses a flat layout where all
 // protocol-specific fields sit at the top level alongside "type" and "tag".
-func outboundConfigToSingbox(oc model.OutboundConfig) M {
+//
+// WireGuard outbounds return a second value: sing-box 1.13 removed the
+// WireGuard outbound (it errors out at instance creation), so a wireguard
+// entry must be placed under "endpoints" instead. The returned map is the
+// endpoint object and the caller must not append it to outbounds.
+func outboundConfigToSingbox(oc model.OutboundConfig) (M, M) {
 	m := M{
 		"type": oc.Protocol,
 		"tag":  oc.Tag,
@@ -89,8 +153,12 @@ func outboundConfigToSingbox(oc model.OutboundConfig) M {
 	// Transform common protocol keys to sing-box native format
 	// WireGuard: secret_key -> private_key; peers: endpoint -> address+port
 	if oc.Protocol == "wireguard" {
+		ep := M{"type": "wireguard", "tag": oc.Tag, "mtu": 1280}
 		if sk, ok := oc.Settings["secret_key"]; ok {
-			m["private_key"] = sk
+			ep["private_key"] = sk
+		}
+		if addrs, ok := oc.Settings["address"].([]any); ok {
+			ep["address"] = addrs
 		}
 		if peers, ok := oc.Settings["peers"].([]any); ok {
 			var wgPeers []M
@@ -99,14 +167,14 @@ func outboundConfigToSingbox(oc model.OutboundConfig) M {
 					newPeer := M{}
 					for k, v := range peerMap {
 						if k == "endpoint" {
-							if ep, ok := v.(string); ok {
-								host, portStr, err := net.SplitHostPort(ep)
+							if epStr, ok := v.(string); ok {
+								host, portStr, err := net.SplitHostPort(epStr)
 								if err == nil {
 									newPeer["address"] = host
 									port, _ := strconv.Atoi(portStr)
 									newPeer["port"] = port
 								} else {
-									newPeer["address"] = ep
+									newPeer["address"] = epStr
 								}
 							}
 						} else {
@@ -116,25 +184,28 @@ func outboundConfigToSingbox(oc model.OutboundConfig) M {
 					wgPeers = append(wgPeers, newPeer)
 				}
 			}
-			m["peers"] = wgPeers
+			ep["peers"] = wgPeers
 		}
 
-		// Copy any other top-level settings not handled above
+		// Copy any other top-level settings not handled above (listen_port,
+		// udp_timeout, workers, …). proxy_tag is dropped: endpoints are not
+		// chainable in sing-box.
 		for k, v := range oc.Settings {
-			if k != "secret_key" && k != "peers" {
-				m[k] = v
+			if k != "secret_key" && k != "peers" && k != "address" && k != "proxy_tag" {
+				ep[k] = v
 			}
 		}
-	} else {
-		for k, v := range oc.Settings {
-			m[k] = v
-		}
+		return m, ep
+	}
+
+	for k, v := range oc.Settings {
+		m[k] = v
 	}
 
 	if oc.ProxyTag != "" {
 		m["proxy_tag"] = oc.ProxyTag
 	}
-	return m
+	return m, nil
 }
 
 func mergeRouteList(a, b []map[string]any) []map[string]any {
@@ -144,7 +215,7 @@ func mergeRouteList(a, b []map[string]any) []map[string]any {
 	return res
 }
 
-func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any) M {
+func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any, warpTag, warpMode string) M {
 	var rules []M
 
 	// Structured custom routes now take the highest priority for panel-managed overrides.
@@ -158,6 +229,26 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 	// Raw custom routes remain the escape hatch, but no longer outrank structured rules.
 	for _, cr := range custom {
 		rules = append(rules, M(cr))
+	}
+
+	// WARP egress. When enabled, everything falls through to the warp
+	// endpoint unless an earlier rule sent it elsewhere. In v6 mode only
+	// IPv6 destinations go through WARP — IPv4 keeps using direct.
+	if warpTag != "" {
+		// Fill in resolved destination addresses so the SSRF blocklist and
+		// panel ip_cidr rules below can match domain destinations. The
+		// resolve action is non-terminal; matching continues.
+		rules = append(rules, M{"action": "resolve"})
+		// Anti-loop guard: WARP handshake traffic to the CF ingress ranges
+		// must always leave via the physical interface. The endpoint's own
+		// dialer bypasses routing, so this is defense against user routes
+		// that would capture it.
+		rules = append(rules, M{
+			"ip_cidr": []string{"162.159.192.0/24", "162.159.193.0/24", "162.159.195.0/24"},
+			"port":    []int{2408, 500, 1701, 4500},
+			"network": []string{"udp"},
+			"outbound": "direct",
+		})
 	}
 
 	// Standard blocks for private IPv4 and IPv6 ranges to prevent SSRF.
@@ -187,6 +278,23 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 
 	for _, pr := range panelRoutes {
 		rules = append(rules, compilePanelRouteRule(pr)...)
+	}
+
+	if warpTag != "" {
+		final := warpTag
+		if warpMode == "v6" {
+			// After panel routes: an explicit panel rule still wins over the
+			// v6 split. Private IPv6 is already blocked by the blocklist above.
+			rules = append(rules, M{
+				"ip_version": 6,
+				"outbound":   warpTag,
+			})
+			final = "direct"
+		}
+		return M{
+			"final": final,
+			"rules": rules,
+		}
 	}
 
 	return M{

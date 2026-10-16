@@ -4,21 +4,31 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/warp"
 )
 
 // M is a shorthand for building JSON-like maps
 type M = map[string]interface{}
 
-func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
+func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert, warpAcc *warp.Account) M {
 	var outbounds []M
 	tags := make(map[string]bool)
+
+	// WARP egress outbound (userspace WireGuard client inside xray).
+	warpTag := ""
+	if warpAcc != nil {
+		warpTag = "warp"
+		outbounds = append(outbounds, warpOutboundConfig(warpAcc, "all"))
+	}
 
 	// Panel-defined custom outbounds (structured, converted to Xray native)
 	for _, co := range nc.CustomOutbounds {
@@ -78,10 +88,52 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	}
 
 	// Merge panel routes and static config routes
-	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute))
+	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute), warpTag)
 
 	mergeCustomXray(cfg, kcfg)
 	return cfg
+}
+
+// warpOutboundConfig builds the xray wireguard outbound for the WARP account.
+// mode is "all" (everything) or "v6" (only IPv6 destinations; the routing
+// rules enforce the split, the tunnel always has both address families).
+func warpOutboundConfig(acc *warp.Account, mode string) M {
+	addresses := acc.AddressList()
+	if mode == "v6" {
+		// Only claim the v6 tunnel address locally; the routing rules make
+		// sure no v4 traffic is sent into this outbound anyway.
+		var v6Only []string
+		for _, a := range addresses {
+			if strings.Contains(a, ":") {
+				v6Only = append(v6Only, a)
+			}
+		}
+		if len(v6Only) > 0 {
+			addresses = v6Only
+		}
+	}
+	peer := M{
+		"publicKey": acc.PeerKey,
+		"endpoint":  net.JoinHostPort(acc.EndpointHost, strconv.Itoa(acc.EndpointPort)),
+	}
+	if r := acc.Reserved; r != [3]byte{} {
+		peer["reserved"] = []uint8{r[0], r[1], r[2]}
+	}
+	return M{
+		"protocol": "wireguard",
+		"tag":      "warp",
+		"settings": M{
+			"address":     addresses,
+			"secretKey":   acc.PrivateKey,
+			"peers":       []M{peer},
+			"mtu":         1280,
+			"NoKernelTun": true,
+			// xray resolves the CF ingress with its internal DNS via the
+			// freedom dialer; force IP so no lookup loop can happen even if
+			// the endpoint is given as a hostname.
+			"domainStrategy": "forceip",
+		},
+	}
 }
 
 // outboundConfigToXray converts a structured OutboundConfig (from the panel)
@@ -645,7 +697,7 @@ func buildRealitySettings(nc *model.NodeSpec) M {
 	return reality
 }
 
-func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteRule, customRules []map[string]any) M {
+func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteRule, customRules []map[string]any, warpTag string) M {
 	var xrayRules []M
 
 	// Structured custom routes now take the highest priority for panel-managed overrides.
@@ -659,6 +711,21 @@ func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteR
 	// Raw custom routes remain the escape hatch, but no longer outrank structured rules.
 	for _, cr := range customRules {
 		xrayRules = append(xrayRules, M(cr))
+	}
+
+	if warpTag != "" {
+		// Anti-loop: WARP handshake traffic to the CF ingress must not be
+		// captured by the final-warp rule. The wireguard bind dials the
+		// endpoint through xray's dispatcher (it goes through routing!),
+		// so this rule is load-bearing — without it the tunnel deadlocks.
+		// It must come BEFORE any user rule that could match the ingress.
+		xrayRules = append(xrayRules, M{
+			"type":        "field",
+			"ip":          []string{"162.159.192.0/24", "162.159.193.0/24", "162.159.195.0/24"},
+			"port":        "2408,500,1701,4500",
+			"network":     "udp",
+			"outboundTag": "direct",
+		})
 	}
 
 	xrayRules = append(xrayRules, M{
@@ -681,6 +748,16 @@ func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteR
 
 	for _, rule := range rules {
 		xrayRules = append(xrayRules, compilePanelRouteRule(rule)...)
+	}
+
+	if warpTag != "" {
+		// Everything not matched above goes through WARP. Private-range and
+		// panel rules above still win — they were appended earlier.
+		xrayRules = append(xrayRules, M{
+			"type":        "field",
+			"ip":          []string{"0.0.0.0/0", "::/0"},
+			"outboundTag": warpTag,
+		})
 	}
 
 	return M{

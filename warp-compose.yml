@@ -1,0 +1,44 @@
+# xboard-node with Cloudflare WARP egress (node mode only).
+#
+#   docker compose up -d
+#
+# The whole ./data directory is a volume: config, WARP account state and
+# kernel artifacts all live there, so container rebuilds reuse the same
+# WARP device instead of re-registering (registration from datacenter IPs
+# is frequently rate-limited).
+#
+# Required environment:
+#   API_HOST   panel URL, e.g. https://panel.example.com
+#   API_KEY    server token from the panel
+#   NODE_ID    node id configured in the panel
+#
+# WARP egress (set WARP_MODE=all or v6 to enable; default off):
+#   WARP_MODE         all | v6   (v6 = only IPv6 destinations via WARP)
+#   WARP_LICENSE_KEY  optional, bind a WARP+ subscription
+#   WARP_ENDPOINT     optional, comma-separated ingress overrides,
+#                     e.g. 162.159.192.1:2408,162.159.193.1:2408
+#   WARP_STATE_DIR    optional, default /etc/xboard-node/warp
+
+services:
+  xboard-node:
+    image: ghcr.io/cedar2025/xboard-node:latest
+    container_name: xboard-node
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      API_HOST: ${API_HOST:?set API_HOST in .env}
+      API_KEY: ${API_KEY:?set API_KEY in .env}
+      NODE_ID: ${NODE_ID:?set NODE_ID in .env}
+      KERNEL_TYPE: ${KERNEL_TYPE:-singbox}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      WARP_MODE: ${WARP_MODE:-off}
+      WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
+      WARP_ENDPOINT: ${WARP_ENDPOINT:-}
+    volumes:
+      - ./data:/etc/xboard-node
+    command: ["-c", "/etc/xboard-node/config.yml"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

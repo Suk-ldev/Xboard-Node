@@ -42,6 +42,42 @@ type Config struct {
 	// via GET /api/v2/server/machine/nodes. When set, Panel.NodeID, Nodes
 	// and Panel.Token are ignored; the machine token is used instead.
 	Machine *MachineConfig `yaml:"machine,omitempty"`
+
+	// Warp routes egress traffic through Cloudflare WARP (userspace
+	// WireGuard). Node mode only — rejected in machine mode.
+	Warp *WarpConfig `yaml:"warp,omitempty"`
+}
+
+// WarpConfig configures the Cloudflare WARP egress.
+// Mode values:
+//
+//	"off"  (or empty) — direct egress, no WARP (default)
+//	"all"             — all egress traffic goes through WARP
+//	"v6"              — only IPv6 destinations go through WARP (useful on
+//	                    IPv4-only servers; needs a v6-capable account, which
+//	                    free WARP registration provides)
+type WarpConfig struct {
+	Mode string `yaml:"mode"`
+	// LicenseKey binds the account to a WARP+ subscription (optional).
+	LicenseKey string `yaml:"license_key"`
+	// Endpoints overrides the candidate WARP ingress list
+	// ("host:port[,host:port...]"). Anycast defaults are used when empty.
+	Endpoints string `yaml:"endpoints"`
+	// StateDir overrides the directory holding per-node WARP account state
+	// (default: <config_dir>/warp). Keep it on a persistent volume so
+	// container restarts don't re-register devices.
+	StateDir string `yaml:"state_dir"`
+	// AccountFile imports an existing WARP account instead of registering a
+	// new device (optional). JSON with the same shape as the state file.
+	AccountFile string `yaml:"account_file"`
+	// RegisterTimeout caps a single registration attempt (seconds).
+	// 0 = 30s default.
+	RegisterTimeout int `yaml:"register_timeout"`
+}
+
+// Enabled reports whether WARP egress is active.
+func (w *WarpConfig) Enabled() bool {
+	return w != nil && w.Mode != "" && w.Mode != "off"
 }
 
 // MachineConfig identifies this process as a panel-managed machine that
@@ -434,6 +470,23 @@ func (c *Config) applyEnvOverrides() {
 		}
 		c.Machine.Token = v
 	}
+	if v := envFirst("WARP_MODE"); v != "" {
+		if c.Warp == nil {
+			c.Warp = &WarpConfig{}
+		}
+		c.Warp.Mode = v
+	}
+	if c.Warp != nil {
+		if v := envFirst("WARP_LICENSE_KEY"); v != "" {
+			c.Warp.LicenseKey = v
+		}
+		if v := envFirst("WARP_ENDPOINT"); v != "" {
+			c.Warp.Endpoints = v
+		}
+		if v := envFirst("WARP_STATE_DIR"); v != "" {
+			c.Warp.StateDir = v
+		}
+	}
 }
 
 func (c *Config) resolveEnvRefs() {
@@ -493,6 +546,11 @@ func (c *Config) inheritFrom(parent *Config) {
 	}
 	if c.Runtime.GoMemLimit == "" {
 		c.Runtime.GoMemLimit = parent.Runtime.GoMemLimit
+	}
+	// Warp (NOT state_dir — each instance needs unique dir)
+	if c.Warp == nil && parent.Warp != nil {
+		w := *parent.Warp
+		c.Warp = &w
 	}
 	// Kernel (NOT config_dir — each instance needs unique dir)
 	if c.Kernel.Type == "" {
@@ -723,6 +781,22 @@ func (c *Config) validate() error {
 	case "singbox", "xray":
 	default:
 		return fmt.Errorf("kernel.type must be 'singbox' or 'xray', got '%s'", c.Kernel.Type)
+	}
+	if c.Warp != nil {
+		if c.IsMachineMode() {
+			return fmt.Errorf("warp is not supported in machine mode")
+		}
+		switch c.Warp.Mode {
+		case "", "off", "all", "v6":
+		default:
+			return fmt.Errorf("warp.mode must be 'off', 'all' or 'v6', got '%s'", c.Warp.Mode)
+		}
+		if !c.Warp.Enabled() && (c.Warp.LicenseKey != "" || c.Warp.Endpoints != "" || c.Warp.AccountFile != "") {
+			return fmt.Errorf("warp.mode is off but warp settings are present")
+		}
+		if c.Warp.RegisterTimeout < 0 {
+			return fmt.Errorf("warp.register_timeout must not be negative")
+		}
 	}
 	if c.Cert.AutoTLS && c.Cert.Domain == "" {
 		return fmt.Errorf("cert.domain is required when cert.auto_tls is enabled")

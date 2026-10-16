@@ -49,7 +49,7 @@ func TestBuildConfig_OutboundPriority(t *testing.T) {
 		},
 	}
 
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{})
+	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, nil)
 	outbounds := cfg["outbounds"].([]M)
 
 	// Since we overrode both 'direct' and 'block', the result should contain
@@ -164,7 +164,7 @@ func TestBuildConfig_AllProtocols_ValidJSON(t *testing.T) {
 
 	for _, tc := range protocols {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := buildConfig(testKernelCfg, testNodeSpec(&tc.nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")})
+			cfg := buildConfig(testKernelCfg, testNodeSpec(&tc.nc), testUsers, kernel.TLSCert{}, nil)
 
 			data, err := json.Marshal(cfg)
 			if err != nil {
@@ -197,7 +197,7 @@ func TestBuildConfig_VMess_Users(t *testing.T) {
 		Protocol:   "vmess",
 		ServerPort: 10086,
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{}, nil)
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -237,7 +237,7 @@ func TestBuildConfig_VLESS_Flow(t *testing.T) {
 			"server_name": "example.com",
 		},
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{}, nil)
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -260,7 +260,7 @@ func TestBuildConfig_VLESS_Flow(t *testing.T) {
 }
 
 func TestBuildRouting_Default(t *testing.T) {
-	routing := buildRouting(nil, nil, nil)
+	routing := buildRouting(nil, nil, nil, "")
 	rules := routing["rules"].([]M)
 
 	if len(rules) != 1 {
@@ -290,7 +290,7 @@ func TestBuildRouting_WithRules(t *testing.T) {
 		},
 	}
 
-	routing := buildRouting(testRouteRules(rules), nil, nil)
+	routing := buildRouting(testRouteRules(rules), nil, nil, "")
 	xrayRules := routing["rules"].([]M)
 
 	// 1 default + 2 domain rules + 1 IP rule = 4
@@ -341,7 +341,7 @@ func TestBuildRouting_WithCustomRouteRules(t *testing.T) {
 		},
 	}
 
-	routing := buildRouting(nil, customRules, nil)
+	routing := buildRouting(nil, customRules, nil, "")
 	xrayRules := routing["rules"].([]M)
 	if len(xrayRules) != 6 {
 		t.Fatalf("expected 6 rules, got %d", len(xrayRules))
@@ -372,7 +372,7 @@ func TestBuildRouting_StructuredCustomRulesRemainFirst(t *testing.T) {
 		Match:  model.RouteMatch{DomainSuffixes: []string{"structured.example"}},
 		Action: model.RouteAction{Type: "direct"},
 	}}
-	routing := buildRouting(nil, custom, raw)
+	routing := buildRouting(nil, custom, raw, "")
 	xrayRules := routing["rules"].([]M)
 	if xrayRules[0]["outboundTag"] != "direct" {
 		t.Fatalf("expected structured rule first, got %v", xrayRules[0]["outboundTag"])
@@ -409,7 +409,7 @@ func TestBuildConfig_StatsEnabled(t *testing.T) {
 		Protocol:   "vmess",
 		ServerPort: 10086,
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{}, nil)
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -439,7 +439,7 @@ func TestBuildConfig_Shadowsocks_MultiUserTraditional(t *testing.T) {
 		ServerPort: 8388,
 		Cipher:     "aes-128-gcm",
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{}, nil)
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -472,7 +472,7 @@ func TestBuildConfig_Shadowsocks_MultiUser(t *testing.T) {
 		Cipher:     "2022-blake3-aes-128-gcm",
 		ServerKey:  "server-key",
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{}, nil)
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
@@ -496,7 +496,7 @@ func TestBuildConfig_SocksStats(t *testing.T) {
 		Protocol:   "socks",
 		ServerPort: 1080,
 	}
-	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{})
+	cfg := buildConfig(testKernelCfg, testNodeSpec(&nc), testUsers, kernel.TLSCert{}, nil)
 	data, _ := json.Marshal(cfg)
 
 	var parsed map[string]interface{}
