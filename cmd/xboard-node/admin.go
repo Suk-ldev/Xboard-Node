@@ -65,7 +65,7 @@ func serveAdmin(port int) error {
 		return fmt.Errorf("listen admin port %d: %w", port, err)
 	}
 	srv := &http.Server{
-		Handler:           admin.Mount(st.Admin.BasePath, panel),
+		Handler:           admin.Mount(panel),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	nlog.Core().Info("admin panel listening",

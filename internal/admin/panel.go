@@ -59,6 +59,7 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("POST /api/warp/reset", p.handleWarpReset)
 	mux.HandleFunc("GET /api/links", p.handleLinks)
 	mux.HandleFunc("POST /api/password", p.handlePassword)
+	mux.HandleFunc("POST /api/basepath", p.handleBasePath)
 	return mux
 }
 
@@ -99,10 +100,46 @@ type statePatch struct {
 	SubURL            *string `json:"sub_url"`
 	ResidentialOnly   *bool   `json:"residential_only"`
 	MaxFraudScore     *int    `json:"max_fraud_score"`
-	Countries         *string `json:"countries"`     // comma-separated; empty clears
-	ManualUUID        *string `json:"manual_uuid"`   // empty = public default
-	AdminBasePath     *string `json:"admin_base_path"`
-	AdminNewPassword  *string `json:"admin_new_password"`
+	Countries         *string `json:"countries"`   // comma-separated; empty clears
+	ManualUUID        *string `json:"manual_uuid"` // empty = public default
+}
+
+// SetBasePath changes the panel's secret URL path (runtime-effective: the
+// mount gate reads it per request). Also available as a dedicated endpoint
+// (POST api/basepath) so a stale page can rehome itself via the redirect
+// flow. Empty/whitespace generates a fresh random path.
+func (p *Panel) SetBasePath(newPath string) (string, error) {
+	newPath = strings.TrimSpace(newPath)
+	if newPath == "" {
+		newPath = "/" + egress.RandomHex(8)
+	}
+	if !strings.HasPrefix(newPath, "/") {
+		newPath = "/" + newPath
+	}
+	newPath = strings.TrimSuffix(newPath, "/")
+	if len(newPath) < 2 {
+		return "", fmt.Errorf("base path too short")
+	}
+	forbidden := []string{"/api", "/static", "/admin"}
+	for _, f := range forbidden {
+		if newPath == f {
+			return "", fmt.Errorf("base path %q is reserved", f)
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.state.Admin.BasePath = newPath
+	if err := p.store.Save(p.state); err != nil {
+		return "", err
+	}
+	return newPath, nil
+}
+
+// BasePath returns the current secret path (mount gate reads per request).
+func (p *Panel) BasePath() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.state.Admin.BasePath
 }
 
 func (p *Panel) handleSetState(w http.ResponseWriter, r *http.Request) {
@@ -327,6 +364,25 @@ func (p *Panel) handlePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// handleBasePath changes the secret URL path. Takes {"base_path": "..."}
+// (leading slash optional; empty = regenerate). Response carries the new
+// path so the browser can follow immediately.
+func (p *Panel) handleBasePath(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BasePath string `json:"base_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apiErr(w, 400, "bad json: "+err.Error())
+		return
+	}
+	newPath, err := p.SetBasePath(req.BasePath)
+	if err != nil {
+		apiErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "base_path": newPath})
 }
 
 // HashPassword derives a scrypt-less salted SHA-256 (sufficient for a

@@ -123,11 +123,20 @@ summary{cursor:pointer;color:var(--dim);font-size:12px}
   <h2>面板安全</h2>
   <div class="row">
     <div>
+      <label>访问路径（改后旧地址立即失效，页面自动跳转）</label>
+      <input type="text" id="new-basepath" placeholder="留空=随机生成新路径">
+    </div>
+    <div>
       <label>新密码（≥8 位）</label>
       <input type="password" id="new-password" placeholder="留空不改">
     </div>
   </div>
-  <button id="save-password">修改密码</button>
+  <div class="row">
+    <button id="save-password">修改密码</button>
+    <button id="save-basepath">修改访问路径</button>
+    <button id="regen-basepath" class="ghost">随机新路径</button>
+  </div>
+  <div class="muted" style="margin-top:8px">当前路径：<code id="cur-path"></code>（改完记住新地址，只有这一处显示）</div>
 </div>
 
 <div id="toast"></div>
@@ -154,6 +163,7 @@ async function loadState(){
     const cur=j.current&&j.current.node?j.current.node:'—';
     kv.innerHTML='<b>家宽出口</b><span>'+cur+(j.has_current?'':'（未选择）')+'</span>';
     $('dot-current').className='dot'+(j.has_current?' ok':'');
+    $('cur-path').textContent=location.pathname.replace(/\/$/,'');
     const wk=$('warp-kv');
     wk.innerHTML='<b>设备 ID</b><span>'+(j.warp_device||'未启用')+'</span>'+
       '<b>运行时间</b><span>'+fmtDur(j.uptime_s)+'</span>';
@@ -194,7 +204,14 @@ $('warp-reset').onclick=async()=>{if(!confirm('重新注册 WARP 设备？数据
   try{await api('api/warp/reset');toast('已重置，稍后查看设备 ID',true);setTimeout(loadState,3000)}catch(e){toast(e.message,false)}};
 $('save-password').onclick=async()=>{const p=$('new-password').value;if(p&&p.length<8){toast('密码至少 8 位',false);return}
   if(!p){toast('未输入新密码',false);return}
-  try{await api('api/password',{password:p});toast('密码已更新',true);$('new-password').value=''}catch(e){toast(e.message,false)}};
+  try{await api('api/password',{password:p});toast('密码已更新（后续请求用新密码）',true);$('new-password').value=''}catch(e){toast(e.message,false)}};
+async function changeBasePath(v){
+  try{const j=await api('api/basepath',{base_path:v});
+    toast('路径已改为 '+j.base_path+'，正在跳转…',true);
+    const u=new URL(location.href);u.pathname=j.base_path+'/';setTimeout(()=>location.replace(u.href),800);
+  }catch(e){toast(e.message,false)}}
+$('save-basepath').onclick=()=>changeBasePath($('new-basepath').value.trim());
+$('regen-basepath').onclick=()=>changeBasePath('');
 loadState();loadLinks();setInterval(loadState,15000);
 </script>
 </body>
