@@ -1,0 +1,44 @@
+# xboard-node compose — panel connection + built-in egress control panel.
+#
+#   cp .env.example .env   # fill in API_HOST / API_KEY / NODE_ID
+#   docker compose up -d
+#   docker logs xboard-node 2>&1 | grep "generated credentials"
+#
+# The whole ./data directory is a single volume: config, WARP account state,
+# vpngate link cache, egress policy (egress.json) and panel credentials all
+# live there, so container rebuilds reuse the same WARP device (re-registering
+# from datacenter IPs is frequently rate-limited) and keep the panel path.
+#
+# Egress (WARP / vpngate residential exits) is managed in the built-in panel;
+# the WARP_MODE / VG_* env vars below only seed the first boot.
+
+services:
+  xboard-node:
+    image: ghcr.io/suk-ldev/xboard-node:latest
+    container_name: xboard-node
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      API_HOST: ${API_HOST:?set API_HOST in .env}
+      API_KEY: ${API_KEY:?set API_KEY in .env}
+      NODE_ID: ${NODE_ID:?set NODE_ID in .env}
+      KERNEL_TYPE: ${KERNEL_TYPE:-singbox}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Built-in egress control panel (see docs-egress.md)
+      ADMIN_PORT: ${ADMIN_PORT:-}
+      # Seeds for first boot only; the panel owns them afterwards.
+      WARP_MODE: ${WARP_MODE:-off}
+      WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
+      WARP_ENDPOINT: ${WARP_ENDPOINT:-}
+      VG_MODE: ${VG_MODE:-off}
+      VG_SUB_URL: ${VG_SUB_URL:-}
+      VG_RESIDENTIAL_ONLY: ${VG_RESIDENTIAL_ONLY:-}
+      VG_MAX_FRAUD: ${VG_MAX_FRAUD:-}
+    volumes:
+      - ./data:/etc/xboard-node
+    command: ["-c", "/etc/xboard-node/config.yml"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

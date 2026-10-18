@@ -47,7 +47,7 @@ func assertParsesAsSingbox(t *testing.T, cfg M) {
 func TestBuildConfig_WarpAll(t *testing.T) {
 	kcfg := config.KernelConfig{LogLevel: "info"}
 	nc := &panel.NodeConfig{Protocol: "shadowsocks", ServerPort: 111, Cipher: "aes-128-gcm"}
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, testWarpAccount(), "all")
+	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, testWarpAccount(), "all", nil)
 
 	eps, ok := cfg["endpoints"].([]M)
 	if !ok || len(eps) != 1 {
@@ -70,7 +70,7 @@ func TestBuildConfig_WarpAll(t *testing.T) {
 func TestBuildConfig_WarpV6(t *testing.T) {
 	kcfg := config.KernelConfig{LogLevel: "info"}
 	nc := &panel.NodeConfig{Protocol: "shadowsocks", ServerPort: 111, Cipher: "aes-128-gcm"}
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, testWarpAccount(), "v6")
+	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, testWarpAccount(), "v6", nil)
 
 	route := cfg["route"].(M)
 	assertMapValue(t, route, "final", "direct")
@@ -93,7 +93,7 @@ func TestBuildConfig_WarpV6(t *testing.T) {
 func TestBuildConfig_WarpWithoutAccount(t *testing.T) {
 	kcfg := config.KernelConfig{LogLevel: "info"}
 	nc := &panel.NodeConfig{Protocol: "shadowsocks", ServerPort: 111, Cipher: "aes-128-gcm"}
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, nil, "")
+	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, nil, "", nil)
 
 	if _, ok := cfg["endpoints"]; ok {
 		t.Error("endpoints injected without warp account")
@@ -110,7 +110,7 @@ func TestBuildRoutes_WarpCustomRouteWins(t *testing.T) {
 		},
 		Action: model.RouteAction{Type: "direct"},
 	}}
-	route := buildRoutes(nil, customRules, nil, "warp", "all")
+	route := buildRoutes(nil, customRules, nil, "warp", "all", "")
 
 	allRules := route["rules"].([]M)
 	// Structured custom rules must stay first.
@@ -159,7 +159,7 @@ func TestBuildConfig_AllProtocolsParseWithWarp(t *testing.T) {
 	for _, proto := range protocols {
 		t.Run(proto, func(t *testing.T) {
 			nc := &panel.NodeConfig{Protocol: proto, ServerPort: 443}
-			cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, testWarpAccount(), "all")
+			cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, testWarpAccount(), "all", nil)
 			assertParsesAsSingbox(t, cfg)
 		})
 	}

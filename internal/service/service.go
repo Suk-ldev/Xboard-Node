@@ -26,7 +26,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/monitor"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/tracker"
-	"github.com/cedar2025/xboard-node/internal/warp"
+	"github.com/cedar2025/xboard-node/internal/vpngate"
 )
 
 type Service struct {
@@ -38,7 +38,9 @@ type Service struct {
 	limiter      *limiter.Limiter
 	speedTracker *limiter.SpeedTracker
 	cert         *cert.Manager
-	warp         *warp.Manager
+	// egress holds the combined WARP+vpngate policy (nil when both off).
+	egress         *egressKit
+	egressReloadMu sync.Mutex
 
 	lastConfig *model.NodeSpec
 	lastUsers  []model.UserSpec
@@ -155,11 +157,6 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	l := limiter.New()
 	st := limiter.NewSpeedTracker(l)
 
-	var warpMgr *warp.Manager
-	if cfg.Warp.Enabled() {
-		warpMgr, _ = warp.NewManager(cfg.Warp, cfg.Kernel.ConfigDir, cfg.Panel.NodeID)
-	}
-
 	return &Service{
 		cfg:          cfg,
 		source:       cp,
@@ -169,7 +166,6 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 		limiter:      l,
 		speedTracker: st,
 		cert:         certMgr,
-		warp:         warpMgr,
 		wsEvents:     make(chan controlplane.Event, 16),
 		wsStatusCh:   make(chan controlplane.StatusChange, 4),
 		pullResults:  make(chan pullResult, 1),
@@ -177,34 +173,49 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 }
 
 func (s *Service) Run(ctx context.Context) error {
-	// Prepare WARP egress (register/load account) before anything else. The
+	// Resolve the egress policy (WARP + vpngate residential exit). The
 	// account must exist before the kernel's first Start because it becomes
-	// part of the generated kernel config. Failures are fatal: silently
+	// part of the generated kernel config. WARP failures are fatal: silently
 	// falling back to direct egress would leak the server's real IP, which
 	// is precisely what WARP mode is meant to prevent.
-	if s.cfg.Warp.Enabled() {
-		if s.warp == nil {
-			mgr, err := warp.NewManager(s.cfg.Warp, s.cfg.Kernel.ConfigDir, s.cfg.Panel.NodeID)
-			if err != nil {
-				return fmt.Errorf("warp manager: %w", err)
-			}
-			s.warp = mgr
-		}
-		acc, err := s.warp.Ensure(ctx)
-		if err != nil {
-			return fmt.Errorf("warp: %w", err)
-		}
-		switch k := s.kernel.(type) {
-		case *singbox.SingBox:
-			k.SetWarpAccount(acc)
-		case *xray.Xray:
-			k.SetWarpAccount(acc)
-		}
+	kit, err := setupEgress(s.cfg)
+	if err != nil {
+		return err
+	}
+	s.egress = kit
+	acc, err := kit.ensureWarpAccount(ctx)
+	if err != nil {
+		return fmt.Errorf("warp: %w", err)
+	}
+	kit.applyToKernel(s.kernel, acc)
+	if acc != nil {
 		nlog.Core().Info("warp egress enabled",
-			"mode", s.cfg.Warp.Mode,
+			"mode", kit.state.WarpMode,
 			"device_id", acc.DeviceID,
 		)
 	}
+	if kit.vg != nil {
+		nlog.Core().Info("vpngate egress enabled",
+			"source", kit.state.VpngateSource.URL,
+			"residential_only", kit.state.VpngateSource.ResidentialOnly,
+			"probe_port", vpngate.ProbePort,
+		)
+		// Select the initial node BEFORE the kernel starts: the vpngate
+		// outbound (and probe inbound) only get generated when a link is
+		// present, and sing-box cannot add outbounds on hot reload.
+		kit.selectInitialNode()
+		// Health loop drives subsequent selection + switching; each switch
+		// forces a kernel restart (outbound lists are fixed per instance).
+		kit.onSwitch = func() {
+			s.egressReloadMu.Lock()
+			defer s.egressReloadMu.Unlock()
+			if s.lastConfig != nil && len(s.lastUsers) > 0 {
+				s.startKernel(s.lastConfig, s.lastUsers)
+			}
+		}
+		kit.startHealthLoop(ctx, s.kernel)
+	}
+	kit.notifyPanel()
 
 	// Start cert manager (handles auto-TLS or manual cert verification)
 	if err := s.cert.Start(ctx); err != nil {
@@ -768,6 +779,12 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
+	// Stop any running instance first: the kernels bind their listen ports
+	// during Start, and a vpngate node switch calls this while the old
+	// instance still holds the port ("address already in use").
+	if s.kernel.IsRunning() {
+		s.kernel.Stop()
+	}
 	if err := s.kernel.Start(nc, users, s.cert.TLSCert()); err != nil {
 		nlog.Core().Error("failed to start kernel", "error", err)
 		return false

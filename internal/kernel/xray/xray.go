@@ -34,6 +34,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/vpngate"
 	"github.com/cedar2025/xboard-node/internal/warp"
 )
 
@@ -57,6 +58,8 @@ type Xray struct {
 	cfg config.KernelConfig
 	// warp is the WARP egress account, set before Start when warp is enabled.
 	warp *warp.Account
+	// vpngate is the residential-exit selection (nil link = not generated).
+	vpngate *vpngate.Egress
 
 	// mu protects instance, limitDispatcher, users, protocol, inboundTag,
 	// lastKernelHash, and cumTraffic. Never held during slow I/O.
@@ -90,6 +93,13 @@ func (x *Xray) SetWarpAccount(acc *warp.Account) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	x.warp = acc
+}
+
+// SetVpngate injects the residential-exit selection before Start/Reload.
+func (x *Xray) SetVpngate(vg *vpngate.Egress) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.vpngate = vg
 }
 
 func (x *Xray) Name() string { return "xray" }
@@ -129,7 +139,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	// ── Phase 1: Build config (no shared state) ─────────────────────────
 	x.ensureGeoData(nodeConfig)
 
-	data, err := marshalConfig(x.cfg, nodeConfig, users, tls, x.warp)
+	data, err := marshalConfig(x.cfg, nodeConfig, users, tls, x.warp, x.vpngate)
 	if err != nil {
 		return err
 	}
@@ -652,8 +662,8 @@ func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
 }
 
 // marshalConfig builds the xray JSON config and returns the raw bytes.
-func marshalConfig(cfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert, warpAcc *warp.Account) ([]byte, error) {
-	cfgMap := buildConfig(cfg, nc, users, tls, warpAcc)
+func marshalConfig(cfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert, warpAcc *warp.Account, vg *vpngate.Egress) ([]byte, error) {
+	cfgMap := buildConfig(cfg, nc, users, tls, warpAcc, vg)
 	data, err := json.MarshalIndent(cfgMap, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)

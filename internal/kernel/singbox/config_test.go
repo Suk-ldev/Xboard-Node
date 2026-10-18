@@ -498,7 +498,7 @@ func TestBuildConfig(t *testing.T) {
 		ServerPort: 111,
 		Cipher:     "aes-128-gcm",
 	}
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, nil, "")
+	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, nil, "", nil)
 
 	data, err := json.Marshal(cfg)
 	if err != nil {
@@ -542,7 +542,7 @@ func TestBuildConfig_OutboundPriority(t *testing.T) {
 		},
 	}
 
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, nil, "")
+	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, nil, "", nil)
 	outbounds := cfg["outbounds"].([]M)
 
 	// We have 2 overrides in input, so we should have exactly 2 outbounds total
@@ -595,7 +595,7 @@ func TestBuildConfig_AllProtocols_ValidJSON(t *testing.T) {
 
 	for _, tc := range protocols {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := buildConfig(config.KernelConfig{LogLevel: "warn"}, testNodeSpec(tc.nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")}, nil, "")
+			cfg := buildConfig(config.KernelConfig{LogLevel: "warn"}, testNodeSpec(tc.nc), testUsers, kernel.TLSCert{CertPEM: []byte("CERT"), KeyPEM: []byte("KEY")}, nil, "", nil)
 			data, err := json.Marshal(cfg)
 			if err != nil {
 				t.Fatalf("marshal %s: %v", tc.name, err)
@@ -611,7 +611,7 @@ func TestBuildConfig_AllProtocols_ValidJSON(t *testing.T) {
 // --- Routes ---
 
 func TestBuildRoutes_Default(t *testing.T) {
-	route := buildRoutes(nil, nil, nil, "", "")
+	route := buildRoutes(nil, nil, nil, "", "", "")
 	assertMapValue(t, route, "final", "direct")
 
 	rules := route["rules"].([]M)
@@ -628,7 +628,7 @@ func TestBuildRoutes_WithCustomRules(t *testing.T) {
 		{ID: 2, Match: []string{"10.0.0.0/8"}, Action: "block"},
 		{ID: 3, Match: []string{"allowed.com"}, Action: "direct"},
 	}
-	route := buildRoutes(testRouteRules(rules), nil, nil, "", "")
+	route := buildRoutes(testRouteRules(rules), nil, nil, "", "", "")
 	allRules := route["rules"].([]M)
 
 	if len(allRules) != 5 {
@@ -653,7 +653,7 @@ func TestBuildRoutes_MultiMatch(t *testing.T) {
 		{ID: 1, Match: []string{"*.evil.com", "bad.org", "192.168.1.0/24"}, Action: "block"},
 		{ID: 2, Match: []string{"*.bypass.com"}, Action: "direct"},
 	}
-	route := buildRoutes(testRouteRules(rules), nil, nil, "", "")
+	route := buildRoutes(testRouteRules(rules), nil, nil, "", "", "")
 	allRules := route["rules"].([]M)
 
 	// 2 default private-IP rules + 1 domain rule + 1 CIDR rule + 1 domain rule = 5
@@ -699,7 +699,7 @@ func TestBuildRoutes_WithCustomRouteRules(t *testing.T) {
 			Action: model.RouteAction{Type: "direct"},
 		},
 	}
-	route := buildRoutes(nil, customRules, nil, "", "")
+	route := buildRoutes(nil, customRules, nil, "", "", "")
 	allRules := route["rules"].([]M)
 	if len(allRules) != 9 {
 		t.Fatalf("rules count: got %d, want 9", len(allRules))
@@ -733,7 +733,7 @@ func TestBuildRoutes_StructuredCustomRulesRemainFirst(t *testing.T) {
 		Match:  model.RouteMatch{DomainSuffixes: []string{"structured.example"}},
 		Action: model.RouteAction{Type: "direct"},
 	}}
-	route := buildRoutes(nil, custom, raw, "", "")
+	route := buildRoutes(nil, custom, raw, "", "", "")
 	allRules := route["rules"].([]M)
 	if allRules[0]["outbound"] != "direct" {
 		t.Fatalf("expected structured route first, got %v", allRules[0]["outbound"])

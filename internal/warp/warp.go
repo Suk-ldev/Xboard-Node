@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ViRb3/wgcf/v2/cloudflare"
@@ -44,6 +45,7 @@ type Account struct {
 
 // Manager owns the per-node WARP account lifecycle.
 type Manager struct {
+	mu       sync.Mutex
 	cfg      *config.WarpConfig
 	stateDir string
 	fileName string
@@ -72,6 +74,21 @@ func NewManager(cfg *config.WarpConfig, configDir string, nodeID int) (*Manager,
 
 // Account returns the loaded account (after Ensure).
 func (m *Manager) Account() *Account { return m.account }
+
+// Reset drops the stored device and forces a fresh registration on the next
+// Ensure. Used by the admin panel ("re-register" button). Registration from
+// datacenter IPs is heavily rate-limited — the caller surfaces the error.
+func (m *Manager) Reset() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.account = nil
+	path := filepath.Join(m.stateDir, m.fileName)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove %s: %w", path, err)
+	}
+	nlog.Core().Info("warp: account reset, will re-register on next start", "path", path)
+	return nil
+}
 
 // CandidateEndpoints lists WARP ingress endpoints to try, most preferred
 // first. WARP ingress is anycast — one address reaches the nearest

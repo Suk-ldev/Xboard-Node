@@ -9,15 +9,19 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/egress"
 	"github.com/cedar2025/xboard-node/internal/machine"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/service"
+	"github.com/cedar2025/xboard-node/internal/vpngate"
+	"github.com/cedar2025/xboard-node/internal/warp"
 )
 
 var (
@@ -28,6 +32,7 @@ var (
 func main() {
 	configPath := flag.String("c", "config.yml", "config file path")
 	showVersion := flag.Bool("v", false, "show version")
+	adminPort := flag.Int("admin-port", 0, "egress control panel port (0 = ADMIN_PORT env or disabled)")
 	flag.Parse()
 
 	if *showVersion {
@@ -51,11 +56,25 @@ func main() {
 	// Apply runtime memory tuning before anything else allocates.
 	applyRuntimeConfig(instances[0].Runtime)
 
-	runWithReload(rootCfg, *configPath)
+	runWithReload(rootCfg, *configPath, adminPortFromFlag(*adminPort))
+}
+
+// adminPortFromFlag resolves the panel port: flag > env > disabled.
+func adminPortFromFlag(flagVal int) int {
+	if flagVal > 0 {
+		return flagVal
+	}
+	if v := strings.TrimSpace(os.Getenv("ADMIN_PORT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // runWithReload restarts all node services when the config file changes.
-func runWithReload(initialRoot *config.RootConfig, configPath string) {
+// adminPort > 0 additionally serves the built-in egress control panel.
+func runWithReload(initialRoot *config.RootConfig, configPath string, adminPort int) {
 	var healthSrv *http.Server
 	var healthPort int
 	startHealth := func(port int) {
@@ -94,6 +113,17 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			healthSrv.Close()
 		}
 	}()
+
+	// Egress control panel (WARP + vpngate). Credentials live in the first
+	// instance's config dir (egress.json) so they survive restarts; the
+	// password is generated on first boot and logged once. The panel waits
+	// for the service's egress kit (OnEgressReady) before serving.
+	if adminPort > 0 {
+		service.OnEgressReadyHook = func(store *egress.Store, st *egress.State, sub *vpngate.Manager, vg *vpngate.Egress, wm *warp.Manager, apply, switchFn func(), warpReset func() error) {
+			OnEgressReady(store, st, sub, vg, wm, apply, switchFn, warpReset)
+		}
+		startAdminPanel(adminPort)
+	}
 
 	for root := initialRoot; ; {
 		ctx, cancel := context.WithCancel(context.Background())

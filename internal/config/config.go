@@ -14,9 +14,15 @@ import (
 	"strings"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/vpngate"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 )
+
+// vpngateSrcWithFraud builds a seed source with only the fraud ceiling set.
+func vpngateSrcWithFraud(n int) vpngate.Source {
+	return vpngate.Source{MaxFraudScore: n}
+}
 
 type Config struct {
 	InstanceID string `yaml:"-"`
@@ -46,6 +52,19 @@ type Config struct {
 	// Warp routes egress traffic through Cloudflare WARP (userspace
 	// WireGuard). Node mode only — rejected in machine mode.
 	Warp *WarpConfig `yaml:"warp,omitempty"`
+
+	// Vpngate seeds the residential-exit egress (sdise/vpngate VLESS links).
+	// The admin panel (egress.json) owns the live state after first boot.
+	Vpngate *VpngateSeed `yaml:"vpngate,omitempty"`
+}
+
+// VpngateSeed is the static seed for the vpngate residential egress.
+type VpngateSeed struct {
+	// Enabled turns the egress on at first boot ("all": all v4 traffic goes
+	// through the residential exit). Equivalent env: VG_MODE=all|off.
+	Enabled bool `yaml:"enabled"`
+	// Source overrides subscription URL and filters; see vpngate.Source.
+	Source vpngate.Source `yaml:",inline"`
 }
 
 // WarpConfig configures the Cloudflare WARP egress.
@@ -485,6 +504,31 @@ func (c *Config) applyEnvOverrides() {
 		}
 		if v := envFirst("WARP_STATE_DIR"); v != "" {
 			c.Warp.StateDir = v
+		}
+	}
+	if v := envFirst("VG_MODE", "VPNGATE_MODE"); v != "" {
+		if c.Vpngate == nil {
+			c.Vpngate = &VpngateSeed{}
+		}
+		c.Vpngate.Enabled = v == "all" || v == "on" || v == "true"
+	}
+	if v := envFirst("VG_SUB_URL", "VPNGATE_URL"); v != "" {
+		if c.Vpngate == nil {
+			c.Vpngate = &VpngateSeed{}
+		}
+		c.Vpngate.Source.URL = v
+	}
+	if v := envFirst("VG_RESIDENTIAL_ONLY"); v != "" {
+		if c.Vpngate == nil {
+			c.Vpngate = &VpngateSeed{}
+		}
+		c.Vpngate.Source.ResidentialOnly = v == "1" || v == "true" || v == "on"
+	}
+	if v := envFirst("VG_MAX_FRAUD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && c.Vpngate != nil {
+			c.Vpngate.Source.MaxFraudScore = n
+		} else if err == nil {
+			c.Vpngate = &VpngateSeed{Source: vpngateSrcWithFraud(n)}
 		}
 	}
 }

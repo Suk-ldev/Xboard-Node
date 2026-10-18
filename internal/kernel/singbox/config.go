@@ -12,6 +12,7 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/vpngate"
 	"github.com/cedar2025/xboard-node/internal/warp"
 	"github.com/go-viper/mapstructure/v2"
 )
@@ -19,7 +20,10 @@ import (
 // M is a shorthand for building JSON-like maps
 type M = map[string]interface{}
 
-func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert, warpAcc *warp.Account, warpMode string) M {
+// buildConfig generates the sing-box config. warpAcc wires the WARP endpoint;
+// vg, when non-nil, adds the vpngate residential VLESS outbound plus the
+// internal probe inbound (loopback-only SOCKS used by the egress health loop).
+func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert, warpAcc *warp.Account, warpMode string, vg *vpngate.Egress) M {
 	var outbounds []M
 	var endpoints []M
 	tags := make(map[string]bool)
@@ -29,6 +33,13 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	if warpAcc != nil {
 		warpTag = "warp"
 		endpoints = append(endpoints, warpEndpointConfig(warpAcc))
+	}
+
+	// vpngate residential exit (plain VLESS outbound via the fdip entry).
+	vgTag := ""
+	if vg != nil && vg.Link() != nil {
+		vgTag = "vpngate"
+		outbounds = append(outbounds, vpngateSingboxOutbound(vg))
 	}
 
 	// Panel-defined custom outbounds (structured, converted to sing-box native)
@@ -81,14 +92,22 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	if inbound != nil {
 		cfg["inbounds"] = []M{inbound}
 	}
+	// Internal health-probe inbound: loopback-only SOCKS whose traffic is
+	// routed into the vpngate outbound. Only generated with the outbound so
+	// the port stays closed in plain deployments.
+	if vgTag != "" {
+		if probe := buildProbeInbound(nc, vpngate.ProbePort); probe != nil {
+			cfg["inbounds"] = append(cfg["inbounds"].([]M), probe)
+		}
+	}
 
 	// Merge panel routes and static config routes
-	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute), warpTag, warpMode)
+	cfg["route"] = buildRoutes(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute), warpTag, warpMode, vgTag)
 
 	// The resolve action added for WARP needs a DNS server; give one when the
 	// operator (or panel custom config) hasn't defined any. Local DNS follows
 	// the system resolver, which is fine inside a container.
-	if warpTag != "" {
+	if warpTag != "" || vgTag != "" {
 		if _, hasDNS := cfg["dns"]; !hasDNS {
 			cfg["dns"] = M{
 				"servers": []M{{"type": "local", "tag": "local"}},
@@ -215,8 +234,18 @@ func mergeRouteList(a, b []map[string]any) []map[string]any {
 	return res
 }
 
-func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any, warpTag, warpMode string) M {
+func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteRule, custom []map[string]any, warpTag, warpMode, vgTag string) M {
 	var rules []M
+
+	// The egress-probe inbound ALWAYS routes into the vpngate outbound —
+	// before custom/panel rules — so health checks can never be rerouted
+	// away from the exit they are measuring.
+	if vgTag != "" {
+		rules = append(rules, M{
+			"inbound":  []string{"egress-probe-in"},
+			"outbound": vgTag,
+		})
+	}
 
 	// Structured custom routes now take the highest priority for panel-managed overrides.
 	for _, rule := range customRules {
@@ -291,8 +320,25 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 			})
 			final = "direct"
 		}
+		if vgTag != "" {
+			// vpngate+v6: WARP carries v6 (rule above), the residential exit
+			// carries everything else.
+			final = vgTag
+		}
 		return M{
 			"final": final,
+			"rules": rules,
+		}
+	}
+
+	if vgTag != "" {
+		// Residential exit carries all unmatched traffic. The entry itself
+		// resolves saas.sin.fan via the DNS server above; its dialer dials
+		// directly (no tunnel inside the kernel), so no anti-loop rule is
+		// needed — but the probe inbound must land here, which the inbound's
+		// own route binding handles (see buildProbeInbound).
+		return M{
+			"final": vgTag,
 			"rules": rules,
 		}
 	}
@@ -300,6 +346,36 @@ func buildRoutes(panelRoutes []model.RouteRule, customRules []model.CustomRouteR
 	return M{
 		"final": "direct",
 		"rules": rules,
+	}
+}
+
+// vpngateSingboxOutbound builds the sing-box VLESS outbound for the residential
+// exit (fdip entry + path-encoded volunteer node).
+func vpngateSingboxOutbound(vg *vpngate.Egress) M {
+	l := vg.Link()
+	if l == nil {
+		return M{}
+	}
+	obj := l.SingboxJSON("vpngate", vg.UUID())
+	// Route only user traffic through it — the kernel's own control-plane
+	// requests (panel sync etc.) dial outside sing-box, so nothing else can
+	// loop into this outbound.
+	return obj
+}
+
+// buildProbeInbound builds the loopback SOCKS inbound used by the egress
+// health loop. Its traffic is forced into the vpngate outbound via a dedicated
+// route rule inserted ahead of the panel rules (highest effective priority
+// among automatic rules, still below structured custom rules? — no: probe
+// traffic must ALWAYS reach the exit, so it goes first, before custom rules).
+func buildProbeInbound(nc *model.NodeSpec, port int) M {
+	return M{
+		"type":        "socks",
+		"tag":         "egress-probe-in",
+		"listen":      "127.0.0.1",
+		"listen_port": port,
+		// No users: loopback-only, firewalled by construction (container
+		// network namespace). Set udp: false to keep it TCP-only.
 	}
 }
 

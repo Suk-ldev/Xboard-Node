@@ -13,14 +13,16 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
+	"github.com/cedar2025/xboard-node/internal/vpngate"
 	"github.com/cedar2025/xboard-node/internal/warp"
 )
 
 // M is a shorthand for building JSON-like maps
 type M = map[string]interface{}
 
-func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert, warpAcc *warp.Account) M {
+func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert, warpAcc *warp.Account, vg *vpngate.Egress) M {
 	var outbounds []M
+	var inbounds []M
 	tags := make(map[string]bool)
 
 	// WARP egress outbound (userspace WireGuard client inside xray).
@@ -28,6 +30,13 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 	if warpAcc != nil {
 		warpTag = "warp"
 		outbounds = append(outbounds, warpOutboundConfig(warpAcc, "all"))
+	}
+
+	// vpngate residential exit (plain VLESS outbound via the fdip entry).
+	vgTag := ""
+	if vg != nil && vg.Link() != nil {
+		vgTag = "vpngate"
+		outbounds = append(outbounds, vpngateXrayOutbound(vg))
 	}
 
 	// Panel-defined custom outbounds (structured, converted to Xray native)
@@ -80,18 +89,41 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 
 	inbound := buildInbound(nc, users, tc)
 	if inbound != nil {
-		cfg["inbounds"] = []M{inbound}
+		inbounds = append(inbounds, inbound)
 	} else {
 		nlog.Core().Warn("xray: unsupported protocol, no inbound configured — node will not accept connections",
 			"protocol", nc.Protocol,
 			"supported", "vmess, vless, trojan, shadowsocks, hysteria, socks, http")
 	}
+	// Internal health-probe inbound: loopback-only SOCKS routed into the
+	// vpngate outbound. Only generated with the outbound.
+	if vgTag != "" {
+		inbounds = append(inbounds, M{
+			"tag":      "egress-probe-in",
+			"listen":   "127.0.0.1",
+			"port":     vpngate.ProbePort,
+			"protocol": "socks",
+			"settings": M{"udp": false},
+		})
+	}
+	if len(inbounds) > 0 {
+		cfg["inbounds"] = inbounds
+	}
 
 	// Merge panel routes and static config routes
-	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute), warpTag)
+	cfg["routing"] = buildRouting(nc.Routes, nc.CustomRouteRules, mergeRouteList(nc.CustomRoutes, kcfg.CustomRoute), warpTag, vgTag)
 
 	mergeCustomXray(cfg, kcfg)
 	return cfg
+}
+
+// vpngateXrayOutbound builds the xray VLESS outbound for the residential exit.
+func vpngateXrayOutbound(vg *vpngate.Egress) M {
+	l := vg.Link()
+	if l == nil {
+		return M{}
+	}
+	return l.OutboundJSON("vpngate", vg.UUID())
 }
 
 // warpOutboundConfig builds the xray wireguard outbound for the WARP account.
@@ -697,8 +729,19 @@ func buildRealitySettings(nc *model.NodeSpec) M {
 	return reality
 }
 
-func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteRule, customRules []map[string]any, warpTag string) M {
+func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteRule, customRules []map[string]any, warpTag, vgTag string) M {
 	var xrayRules []M
+
+	// The egress-probe inbound ALWAYS routes into the vpngate outbound —
+	// before custom/panel rules — so health checks can never be rerouted
+	// away from the exit they are measuring.
+	if vgTag != "" {
+		xrayRules = append(xrayRules, M{
+			"type":        "field",
+			"inboundTag":  []string{"egress-probe-in"},
+			"outboundTag": vgTag,
+		})
+	}
 
 	// Structured custom routes now take the highest priority for panel-managed overrides.
 	for _, rule := range customRouteRules {
@@ -757,6 +800,15 @@ func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteR
 			"type":        "field",
 			"ip":          []string{"0.0.0.0/0", "::/0"},
 			"outboundTag": warpTag,
+		})
+	} else if vgTag != "" {
+		// Residential exit carries all unmatched traffic. The outbound dials
+		// the fdip entry directly (kernel-owned dialer, not routed), so no
+		// anti-loop rule is needed.
+		xrayRules = append(xrayRules, M{
+			"type":        "field",
+			"ip":          []string{"0.0.0.0/0", "::/0"},
+			"outboundTag": vgTag,
 		})
 	}
 
