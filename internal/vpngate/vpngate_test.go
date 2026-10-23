@@ -5,122 +5,118 @@ import (
 	"testing"
 )
 
-const sampleSub = `vless://495c7195-85b8-498a-bf20-2ea9ce9175b5@saas.sin.fan:443?encryption=none&security=tls&sni=snip.edgeoneai.cc.cd&fp=chrome&alpn=h3%2Ch2&type=ws&host=snip.edgeoneai.cc.cd&path=%2Ffdip%3Dsstp%3A%2F%2Fvpn%3Avpn%40cetsssa.opengw.net%3A992%3Fed%3D2560#%E5%AE%B6%E5%AE%BD%7C%E7%BA%AF%E5%87%80%E5%BA%A6%3A1%7CMexico%7C81.92%7C%E8%90%BD%E5%9C%B0%3A189.186.183.153
-vless://495c7195-85b8-498a-bf20-2ea9ce9175b5@saas.sin.fan:443?encryption=none&security=tls&sni=snip.edgeoneai.cc.cd&fp=chrome&alpn=h3%2Ch2&type=ws&host=snip.edgeoneai.cc.cd&path=%2Ffdip%3Dsstp%3A%2F%2Fvpn%3Avpn%40public-vpn-137.opengw.net%3A443%3Fed%3D2560#%E6%9C%BA%E6%88%BF%7C%E7%BA%AF%E5%87%80%E5%BA%A6%3A85%7CJapan%7C1165.07%7C%E8%90%BD%E5%9C%B0%3A219.100.37.240
-vless://495c7195-85b8-498a-bf20-2ea9ce9175b5@saas.sin.fan:443?encryption=none&security=tls&sni=snip.edgeoneai.cc.cd&fp=chrome&alpn=h3%2Ch2&type=ws&host=snip.edgeoneai.cc.cd&path=%2Ffdip%3Dsstp%3A%2F%2Fvpn%3Avpn%40vpn584377130.opengw.net%3A1822%3Fed%3D2560#%E5%AE%B6%E5%AE%BD%7C%E7%BA%AF%E5%87%80%E5%BA%A6%3A6%7CJapan%7C84.79%7C%E8%90%BD%E5%9C%B0%3A14.14.148.93
-# comment line
-not-a-link
-`
+// Sample rows from the official API (subset of fields; config abbreviated).
+const sampleAPI = `*vpn_servers
+#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64
+vpn661982,14.10.120.193,2757531,9,326000000,Japan,JP,17,1771632120,12047,600438992411,1,DESKTOP-OTAKK73's owner,,"IyMjIyMjIyMjIyMjIyMjCmRldiB0dW4KcHJvdG8gdGNwCnJlbW90ZSAxNC4xMC4xMjAuMTkzIDc1NTEKY2lwaGVyIEFFUy0xMjgtQ0JDCmRhdGEtY2lwaGVycyBBRVMtMTI4LUNCQwphdXRoIFNIQTEKcmVzb2x2LXJldHJ5IGluZmluaXRlCm5vYmluZApwZXJzaXN0LWtleQpwZXJzaXN0LXR1bgpjbGllbnQKdmVyYiAzCg=="
+public-vpn-137,219.100.37.240,2757531,9,1165000000,Japan,JP,117,1771632120,12047,600438992411,1,Daiyuu Nobori,,"IyMjIyMjIyMjIyMjIyMjCmRldiB0dW4KcHJvdG8gdGNwCnJlbW90ZSAyMTkuMTAwLjM3LjI0MCA0NDMKY2lwaGVyIEFFUy0xMjgtQ0JDCmNsaWVudAo="
+*`
 
-func TestParseLinks(t *testing.T) {
-	links := ParseLinks(sampleSub)
-	if len(links) != 3 {
-		t.Fatalf("expected 3 links, got %d", len(links))
+// The sample config base64 decodes to a minimal OpenVPN client config with
+// remote/proto directives. Verify:
+func TestParseAPI(t *testing.T) {
+	rows := ParseAPI(sampleAPI)
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
 	}
-	l := links[0]
-	if l.NodeHost != "cetsssa.opengw.net" || l.NodePort != 992 {
-		t.Errorf("node = %s:%d, want cetsssa.opengw.net:992", l.NodeHost, l.NodePort)
+	r := rows[0]
+	if r.Host != "vpn661982" || r.IP != "14.10.120.193" || r.Port != 7551 || r.Proto != "tcp" {
+		t.Errorf("row 0 = %+v", r)
 	}
-	if !l.Residential || !l.KnownType {
-		t.Errorf("link 0 should be residential (家宽), got %+v", l)
+	if r.SpeedMbps < 320 || r.SpeedMbps > 330 {
+		t.Errorf("speed = %v, want ~326", r.SpeedMbps)
 	}
-	if l.FraudScore != 1 {
-		t.Errorf("fraud = %d, want 1", l.FraudScore)
+	if !strings.Contains(r.ConfigB64, "IyMj") {
+		t.Errorf("config not carried")
 	}
-	if l.Country != "Mexico" {
-		t.Errorf("country = %q, want Mexico", l.Country)
+	// Decoding the embedded config must yield the remote line.
+	meta, err := ParseConfig(r.ConfigB64, r.IP, r.Port, r.Proto)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
 	}
-	if l.SpeedMbps != 81.92 {
-		t.Errorf("speed = %v, want 81.92", l.SpeedMbps)
+	if meta.Remote != r.IP || meta.Port != 7551 || meta.Proto != "tcp" {
+		t.Errorf("meta = %+v", meta)
 	}
-	if l.ExitIP != "189.186.183.153" {
-		t.Errorf("exit ip = %q", l.ExitIP)
-	}
-	if links[1].Residential || !links[1].KnownType {
-		t.Errorf("link 1 should be datacenter (机房)")
-	}
-	if links[2].Country != "Japan" {
-		t.Errorf("link 2 country = %q", links[2].Country)
+	if !strings.Contains(meta.Body, "cipher AES-128-CBC") {
+		t.Errorf("config body lost: %q", meta.Body)
 	}
 }
 
 func TestFilterResidentialOnly(t *testing.T) {
-	m := NewManager(Source{URL: "x", ResidentialOnly: true, MaxFraudScore: 30})
-	links := m.Filter(ParseLinks(sampleSub))
-	if len(links) != 2 {
-		t.Fatalf("residential-only filter: want 2, got %d", len(links))
+	m := NewManager(Source{URL: "x", ResidentialOnly: true})
+	rows := m.Filter(ParseAPI(sampleAPI))
+	if len(rows) != 1 {
+		t.Fatalf("residential-only: want 1 (public-vpn excluded), got %d", len(rows))
 	}
-	for _, l := range links {
-		if !l.Residential {
-			t.Errorf("datacenter link leaked: %+v", l)
+	if rows[0].Host != "vpn661982" {
+		t.Errorf("wrong survivor: %+v", rows[0])
+	}
+}
+
+func TestFilterCountry(t *testing.T) {
+	m := NewManager(Source{URL: "x", ResidentialOnly: false, Countries: []string{"japan"}})
+	rows := m.Filter(ParseAPI(sampleAPI))
+	if len(rows) != 2 {
+		t.Fatalf("japan filter: want 2, got %d", len(rows))
+	}
+	m2 := NewManager(Source{URL: "x", ResidentialOnly: false, Countries: []string{"United States"}})
+	if rows := m2.Filter(ParseAPI(sampleAPI)); len(rows) != 0 {
+		t.Fatalf("us filter: want 0, got %d", len(rows))
+	}
+}
+
+func TestRenderConfigRewrites(t *testing.T) {
+	meta, err := ParseConfig(sampleAPIrows[0].ConfigB64, "14.10.120.193", 7551, "tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := renderConfig(meta)
+	for _, want := range []string{
+		"remote 14.10.120.193 7551",
+		"proto tcp",
+		"client",
+		"persist-key",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered config missing %q:\n%s", want, out)
+		}
+	}
+	for _, banned := range []string{"redirect-gateway", "route ", "resolv-retry", "dev tun"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("rendered config must not contain %q:\n%s", banned, out)
 		}
 	}
 }
 
-func TestFilterFraudAndCountry(t *testing.T) {
-	m := NewManager(Source{URL: "x", ResidentialOnly: false, MaxFraudScore: 50, Countries: []string{"japan"}})
-	links := m.Filter(ParseLinks(sampleSub))
-	if len(links) != 1 {
-		t.Fatalf("japan+fraud50: want 1, got %d", len(links))
+var sampleAPIrows = ParseAPI(sampleAPI)
+
+func TestParseCSVLine(t *testing.T) {
+	recs, err := parseCSVLine(`a,"b,c","d""e",f`)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if links[0].NodeHost != "vpn584377130.opengw.net" {
-		t.Errorf("wrong survivor: %+v", links[0])
+	want := []string{"a", "b,c", `d"e`, "f"}
+	if len(recs) != len(want) {
+		t.Fatalf("got %v", recs)
+	}
+	for i := range want {
+		if recs[i] != want[i] {
+			t.Errorf("field %d = %q, want %q", i, recs[i], want[i])
+		}
 	}
 }
 
-func TestFilterExcludeIP(t *testing.T) {
-	m := NewManager(Source{URL: "x", ResidentialOnly: false, ExcludeIPs: []string{"219.100.37.240"}})
-	links := m.Filter(ParseLinks(sampleSub))
-	if len(links) != 2 {
-		t.Fatalf("exclude 219.100.37.240: want 2, got %d", len(links))
+func TestCacheRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	rows := ParseAPI(sampleAPI)
+	if err := PersistCache(dir, rows); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestOutboundJSON(t *testing.T) {
-	l := ParseLinks(sampleSub)[0]
-	obj := l.OutboundJSON("vpngate", "")
-	vnext := obj["settings"].(map[string]any)["vnext"].([]map[string]any)[0]
-	if vnext["address"] != EntryHost {
-		t.Errorf("address = %v, want %s", vnext["address"], EntryHost)
+	got := LoadCache(dir)
+	if len(got) != len(rows) {
+		t.Fatalf("round trip: want %d, got %d", len(rows), len(got))
 	}
-	if vnext["users"].([]map[string]any)[0]["id"] != RealUUID {
-		t.Errorf("uuid placeholder not replaced")
-	}
-	ss := obj["streamSettings"].(map[string]any)
-	if ss["network"] != "ws" {
-		t.Errorf("network = %v", ss["network"])
-	}
-	tls := ss["tlsSettings"].(map[string]any)
-	if tls["serverName"] != SNI {
-		t.Errorf("sni = %v, want %s", tls["serverName"], SNI)
-	}
-	if tls["alpn"].([]string)[0] != "http/1.1" {
-		t.Errorf("alpn must be http/1.1 for WS (h3 breaks the entry)")
-	}
-	ws := ss["wsSettings"].(map[string]any)
-	if !strings.Contains(ws["path"].(string), "fdip=sstp://vpn:vpn@cetsssa.opengw.net:992") {
-		t.Errorf("ws path wrong: %v", ws["path"])
-	}
-}
-
-func TestSingboxJSON(t *testing.T) {
-	l := ParseLinks(sampleSub)[2]
-	obj := l.SingboxJSON("vpngate", "custom-uuid")
-	if obj["server"] != EntryHost || obj["uuid"] != "custom-uuid" {
-		t.Errorf("singbox outbound wrong: %+v", obj)
-	}
-	tr := obj["transport"].(map[string]any)
-	if tr["type"] != "ws" || tr["path"] != l.Path {
-		t.Errorf("transport = %+v", tr)
-	}
-}
-
-func TestParseFdipPath(t *testing.T) {
-	host, port, err := parseFdipPath("/fdip=sstp://vpn:vpn@vpn699884073.opengw.net:1556?ed=2560")
-	if err != nil || host != "vpn699884073.opengw.net" || port != 1556 {
-		t.Errorf("got %s:%d err=%v", host, port, err)
-	}
-	if _, _, err := parseFdipPath("/wrong=prefix"); err == nil {
-		t.Error("non-fdip path should error")
+	if got[0].Host != rows[0].Host || got[0].IP != rows[0].IP || got[0].Port != rows[0].Port {
+		t.Errorf("mismatch: %+v vs %+v", got[0], rows[0])
 	}
 }

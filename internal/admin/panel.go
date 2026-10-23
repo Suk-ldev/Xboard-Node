@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -186,9 +185,6 @@ func (p *Panel) handleSetState(w http.ResponseWriter, r *http.Request) {
 		}
 		st.VpngateSource.Countries = list
 	}
-	if patch.ManualUUID != nil {
-		st.ManualUUID = strings.TrimSpace(*patch.ManualUUID)
-	}
 	if err := st.Validate(); err != nil {
 		p.mu.Unlock()
 		apiErr(w, 400, err.Error())
@@ -322,24 +318,22 @@ func (p *Panel) handleLinks(w http.ResponseWriter, _ *http.Request) {
 	links, at, err := p.sub.Fetch(true)
 	if err != nil {
 		// Still return cached links with the warning.
-		writeJSON(w, 200, map[string]any{"links": vpngateLinkList(links), "fetched_at": at, "warning": err.Error()})
+		writeJSON(w, 200, map[string]any{"links": vpngateRowList(links), "fetched_at": at, "warning": err.Error()})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"links": vpngateLinkList(links), "fetched_at": at})
+	writeJSON(w, 200, map[string]any{"links": vpngateRowList(links), "fetched_at": at})
 }
 
-func vpngateLinkList(links []vpngate.Link) []map[string]any {
-	out := make([]map[string]any, 0, len(links))
-	for _, l := range links {
+func vpngateRowList(rows []vpngate.Row) []map[string]any {
+	out := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
 		out = append(out, map[string]any{
-			"node":        l.NodeHost + ":" + strconv.Itoa(l.NodePort),
-			"country":     l.Country,
-			"residential": l.Residential,
-			"known_type":  l.KnownType,
-			"fraud":       l.FraudScore,
-			"speed_mbps":  l.SpeedMbps,
-			"exit_ip":     l.ExitIP,
-			"transport":   l.Transport,
+			"node":       r.Key(),
+			"country":    r.Country,
+			"ip":         r.IP,
+			"sessions":   r.Sessions,
+			"speed_mbps": r.SpeedMbps,
+			"operator":   r.Operator,
 		})
 	}
 	return out
@@ -404,13 +398,14 @@ func (p *Panel) currentSnapshot() (map[string]any, bool) {
 	if p.vg == nil {
 		return nil, false
 	}
-	l := p.vg.Link()
-	if l == nil {
+	r := p.vg.Row()
+	if r == nil {
 		return map[string]any{}, false
 	}
 	return map[string]any{
-		"node":    l.NodeHost + ":" + strconv.Itoa(l.NodePort),
-		"country": l.Country,
+		"node":    r.Key(),
+		"country": r.Country,
+		"ip":      r.IP,
 	}, true
 }
 

@@ -3,15 +3,12 @@ package egress
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -22,67 +19,47 @@ import (
 // Current is the runtime view of the chosen vpngate node plus health state.
 // Reported to the admin panel and updated by the health loop.
 type Current struct {
-	Link      vpngate.Link `json:"link"`
-	ExitIP    string       `json:"exit_ip"`
-	Resident  bool         `json:"residential"`
-	Fraud     int          `json:"fraud_score"`
-	ChangedAt time.Time    `json:"changed_at"`
-	// LastCheck / LastOK drive the panel's health display.
-	LastCheck time.Time `json:"last_check"`
-	LastOK    bool      `json:"last_ok"`
-	// FailStreak counts consecutive failed probes; >= SwitchAfter → switch.
-	FailStreak int `json:"fail_streak"`
+	Row        vpngate.Row `json:"row"`
+	ExitIP     string      `json:"exit_ip"`
+	Resident   bool        `json:"residential"`
+	Fraud      int         `json:"fraud_score"`
+	ChangedAt  time.Time   `json:"changed_at"`
+	LastCheck  time.Time   `json:"last_check"`
+	LastOK     bool        `json:"last_ok"`
+	FailStreak int         `json:"fail_streak"`
 }
 
-// ErrProbeNotApplied is returned by the probe dialer when the kernel's probe
-// inbound is not listening yet (egress not applied to the kernel). Health
-// accounting skips these — they are not node failures.
-var ErrProbeNotApplied = errors.New("probe inbound not applied")
-
 // HealthLoop watches the active vpngate exit and switches nodes when it dies
-// or degrades (leaves the residential pool / fraud ceiling). It talks to the
-// kernel through the internal probe inbound (127.0.0.1 SOCKS) — no root, no
-// tun, exactly like any local SOCKS client.
+// or degrades (leaves the residential pool / fraud ceiling). Probes ride the
+// local SOCKS proxy (which binds to the tun device) — the probe path and the
+// user path are identical by construction.
 type HealthLoop struct {
 	mu       sync.Mutex
 	state    *State
 	current  *Current
-	kernel   *KernelHandle
 	store    *Store
 	sub      *vpngate.Manager
-	vg       *vpngate.Egress // selected links are published here (kernel reads it)
-	usedRing []string        // recently used node ids (avoid immediate reuse)
-	refreshT time.Duration
-	lastSub  time.Time
+	runner   *vpngate.Runner
+	proxy    *vpngate.Proxy
+	vg       *vpngate.Egress
+	usedRing []string // recently used node keys (avoid immediate reuse)
 
-	// OnChange fires after a node switch (service re-applies kernel config).
+	// OnChange fires after a tunnel switch (informational; the kernel does
+	// not need reloads in the OpenVPN model).
 	OnChange func()
-	// OnState fires after any state write that must be persisted.
-	OnState func(*State)
-}
-
-// KernelHandle abstracts the probe path into the kernel. The service wires it
-// to a local SOCKS dialer bound to 127.0.0.1 that routes through the vpngate
-// outbound.
-type KernelHandle struct {
-	// ProbeAddr is "127.0.0.1:<port>" of the internal SOCKS inbound, "" when
-	// the vpngate outbound is not currently generated.
-	ProbeAddr string
-	// ProbeDial dials the probe inbound (kept as a func for tests).
-	ProbeDial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // SwitchAfter is the fail-streak threshold before switching nodes.
 const SwitchAfter = 2
 
-// RefreshEvery re-downloads the subscription at least this often.
-const RefreshEvery = 3 * time.Hour
+// RefreshEvery re-downloads the server list at least this often.
+const RefreshEvery = 1 * time.Hour
 
 // CheckEvery is the health probe cadence.
 const CheckEvery = 30 * time.Second
 
-// ProbeURL returns exit-IP intelligence, same endpoint sdise uses: the reply
-// describes the *egress* IP, so it must be requested through the tunnel.
+// ProbeURL returns exit-IP intelligence: the reply describes the *egress*
+// IP, so it must be requested through the tunnel.
 const ProbeURL = "https://my.ippure.com/v1/info"
 
 // ExitInfo is the decoded probe payload (subset we care about).
@@ -93,20 +70,15 @@ type ExitInfo struct {
 	IsResidential bool   `json:"isResidential"`
 }
 
-func NewHealthLoop(state *State, store *Store, sub *vpngate.Manager, vg *vpngate.Egress, kh *KernelHandle) *HealthLoop {
+func NewHealthLoop(state *State, store *Store, sub *vpngate.Manager, runner *vpngate.Runner, proxy *vpngate.Proxy, vg *vpngate.Egress) *HealthLoop {
 	return &HealthLoop{
 		state:  state,
 		store:  store,
 		sub:    sub,
+		runner: runner,
+		proxy:  proxy,
 		vg:     vg,
-		kernel: kh,
 	}
-}
-
-func (h *HealthLoop) setState(st *State) {
-	h.mu.Lock()
-	h.state = st
-	h.mu.Unlock()
 }
 
 func (h *HealthLoop) getState() *State {
@@ -125,35 +97,31 @@ func (h *HealthLoop) Current() (Current, bool) {
 	return *h.current, true
 }
 
-// PickInitial selects the first node honoring PinnedNode, used-ring avoidance
-// and source filters. Returns false when no candidate is available.
-func (h *HealthLoop) PickInitial(links []vpngate.Link) (vpngate.Link, bool) {
+// PickInitial selects the first row honoring PinnedNode and the used-ring.
+func (h *HealthLoop) PickInitial(rows []vpngate.Row) (vpngate.Row, bool) {
 	h.mu.Lock()
 	pinned := h.state.PinnedNode
 	h.mu.Unlock()
 	if pinned != "" {
-		for _, l := range links {
-			if l.NodeHost+":"+fmt.Sprint(l.NodePort) == pinned {
-				return l, true
+		for _, r := range rows {
+			if r.Key() == pinned {
+				return r, true
 			}
 		}
-		nlog.Core().Warn("vpngate: pinned node not in subscription, falling back to auto", "pinned", pinned)
+		nlog.Core().Warn("vpngate: pinned node not in server list, falling back to auto", "pinned", pinned)
 	}
-	for _, l := range links {
-		id := l.NodeHost + ":" + fmt.Sprint(l.NodePort)
-		if h.recentlyUsed(id) {
-			continue
+	for _, r := range rows {
+		if !h.recentlyUsed(r.Key()) {
+			return r, true
 		}
-		return l, true
 	}
-	// All recently used — reset the ring and take the first.
 	h.mu.Lock()
 	h.usedRing = nil
 	h.mu.Unlock()
-	if len(links) > 0 {
-		return links[0], true
+	if len(rows) > 0 {
+		return rows[0], true
 	}
-	return vpngate.Link{}, false
+	return vpngate.Row{}, false
 }
 
 func (h *HealthLoop) recentlyUsed(id string) bool {
@@ -176,19 +144,20 @@ func (h *HealthLoop) markUsed(id string) {
 	}
 }
 
-// Switch moves to the next candidate (skipping the current one), bumps the
-// used-ring and triggers OnChange.
+// Switch moves to the next candidate (skipping the current one), reconnects
+// the tunnel and triggers OnChange.
 func (h *HealthLoop) Switch(reason string) {
-	links, _, err := h.sub.Fetch(true)
+	rows, _, err := h.sub.Fetch(true)
 	if err != nil {
 		nlog.Core().Warn("vpngate switch: fetch failed", "error", err)
 	}
-	if len(links) == 0 {
+	vpngate.SortBySpeed(rows)
+	if len(rows) == 0 {
 		nlog.Core().Error("vpngate switch: no candidates available")
 		return
 	}
 	cur, _ := h.Current()
-	next, ok := h.pickNext(links, cur.Link.NodeHost+":"+fmt.Sprint(cur.Link.NodePort))
+	next, ok := h.pickNext(rows, cur.Row.Key())
 	if !ok {
 		nlog.Core().Error("vpngate switch: no alternative node available")
 		return
@@ -198,53 +167,68 @@ func (h *HealthLoop) Switch(reason string) {
 
 // pickNext chooses the first candidate that isn't the current node or in the
 // used ring; falls back to any non-current node.
-func (h *HealthLoop) pickNext(links []vpngate.Link, curID string) (vpngate.Link, bool) {
-	var fallback *vpngate.Link
-	for i := range links {
-		l := links[i]
-		id := l.NodeHost + ":" + fmt.Sprint(l.NodePort)
-		if id == curID {
+func (h *HealthLoop) pickNext(rows []vpngate.Row, curKey string) (vpngate.Row, bool) {
+	var fallback *vpngate.Row
+	for i := range rows {
+		r := rows[i]
+		if r.Key() == curKey {
 			continue
 		}
-		if !h.recentlyUsed(id) {
-			return l, true
+		if !h.recentlyUsed(r.Key()) {
+			return r, true
 		}
 		if fallback == nil {
-			fallback = &links[i]
+			fallback = &rows[i]
 		}
 	}
 	if fallback != nil {
 		return *fallback, true
 	}
-	return vpngate.Link{}, false
+	return vpngate.Row{}, false
 }
 
-// ApplyInitial records the initial node selection and publishes it to the
-// kernel-visible Egress WITHOUT firing OnChange (the kernel has not started
-// yet — the first Start will pick the link up).
-func (h *HealthLoop) ApplyInitial(l vpngate.Link) {
-	h.mu.Lock()
-	h.current = &Current{Link: l, ChangedAt: time.Now()}
-	h.mu.Unlock()
-	if h.vg != nil {
-		h.vg.Set(l)
+// connect (re)connects the OpenVPN tunnel to the given node.
+func (h *HealthLoop) connect(r vpngate.Row) error {
+	meta, err := vpngate.ParseConfig(r.ConfigB64, r.IP, r.Port, r.Proto)
+	if err != nil {
+		return err
 	}
-	h.markUsed(l.NodeHost + ":" + fmt.Sprint(l.NodePort))
-	nlog.Core().Info("vpngate: node selected", "why", "initial", "node", l.LogSummary())
+	if err := h.runner.Start(meta, 25*time.Second); err != nil {
+		return err
+	}
+	h.proxy.SetDevice(vpngate.TunName)
+	return nil
 }
 
-// apply records the new node, publishes it to the kernel-visible Egress and
-// fires the change hook.
-func (h *HealthLoop) apply(l vpngate.Link, why string) {
-	now := time.Now()
+// apply records the new node, reconnects and fires the change hook.
+func (h *HealthLoop) apply(r vpngate.Row, why string) {
+	if err := h.connect(r); err != nil {
+		nlog.Core().Error("vpngate: connect failed, keeping old tunnel", "node", r.LogSummary(), "error", err)
+		// Try the next candidate once.
+		rows, _, ferr := h.sub.Fetch(true)
+		if ferr == nil && len(rows) > 0 {
+			vpngate.SortBySpeed(rows)
+			if next, ok := h.pickNext(rows, r.Key()); ok {
+				if cerr := h.connect(next); cerr == nil {
+					r = next
+				} else {
+					return
+				}
+			} else {
+				return
+			}
+		} else {
+			return
+		}
+	}
 	h.mu.Lock()
-	h.current = &Current{Link: l, ChangedAt: now}
+	h.current = &Current{Row: r, ChangedAt: time.Now()}
 	h.mu.Unlock()
 	if h.vg != nil {
-		h.vg.Set(l) // kernel builders read this on next config generation
+		h.vg.Set(r)
 	}
-	h.markUsed(l.NodeHost + ":" + fmt.Sprint(l.NodePort))
-	nlog.Core().Info("vpngate: node selected", "why", why, "node", l.LogSummary())
+	h.markUsed(r.Key())
+	nlog.Core().Info("vpngate: node selected", "why", why, "node", r.LogSummary())
 	if h.OnChange != nil {
 		h.OnChange()
 	}
@@ -280,17 +264,14 @@ func (h *HealthLoop) SetProbeResult(ok bool, info *ExitInfo) {
 func (h *HealthLoop) degraded(info ExitInfo) bool {
 	st := h.getState()
 	src := st.VpngateSource
-	if src.ResidentialOnly && !info.IsResidential {
-		return true
-	}
-	if src.MaxFraudScore > 0 && info.FraudScore > src.MaxFraudScore {
+	if src.MaxFraudScore > 0 && info.FraudScore > src.MaxFraudScore && info.FraudScore > 0 {
 		return true
 	}
 	return false
 }
 
-// Run drives the loop until ctx is done. Returns immediately (with a log) if
-// vpngate is disabled.
+// Run drives the loop until ctx is done. Returns immediately if vpngate is
+// disabled.
 func (h *HealthLoop) Run(ctx context.Context) {
 	if !h.getState().VpngateEnabled() {
 		return
@@ -299,28 +280,31 @@ func (h *HealthLoop) Run(ctx context.Context) {
 }
 
 func (h *HealthLoop) loop(ctx context.Context) {
-	// The service already made the synchronous initial pick (selectInitialNode).
+	// The service made the synchronous initial pick (selectInitialNode).
 	// This loop takes over: probing, failover switching, periodic refresh.
 	t := time.NewTicker(CheckEvery)
 	defer t.Stop()
 	for {
 		if _, ok := h.Current(); !ok {
-			// No selection yet (initial fetch failed): retry with cache/network.
-			links, _, err := h.sub.Fetch(true)
+			// No selection yet (initial fetch failed): retry.
+			rows, _, err := h.sub.Fetch(true)
 			if err != nil {
 				nlog.Core().Warn("vpngate: fetch failed", "error", err)
 			}
-			if len(links) == 0 {
-				if cached := vpngate.LoadCache(h.cacheDir()); len(cached) > 0 {
-					links = h.sub.Filter(cached)
+			if len(rows) == 0 {
+				if cached := vpngate.LoadCache(h.store.Dir()); len(cached) > 0 {
+					rows = h.sub.Filter(cached)
 				}
 			}
-			if len(links) > 0 {
-				if l, ok := h.PickInitial(links); ok {
-					h.apply(l, "late initial")
+			if len(rows) > 0 {
+				vpngate.SortBySpeed(rows)
+				if r, ok := h.PickInitial(rows); ok {
+					if err := h.ApplyInitialRetrying(r, rows); err != nil {
+						nlog.Core().Warn("vpngate: initial connect failed", "error", err)
+					}
 				}
 			} else {
-				nlog.Core().Warn("vpngate: no usable links yet; residential egress inactive")
+				nlog.Core().Warn("vpngate: no usable servers yet; residential egress inactive")
 			}
 		}
 		h.probeOnce(ctx)
@@ -329,15 +313,39 @@ func (h *HealthLoop) loop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		// Periodic subscription refresh (3h) — same cadence as upstream.
 		if time.Since(h.lastFetch()) > RefreshEvery {
-			if fresh, _, err := h.sub.Fetch(false); err == nil && len(fresh) > 0 {
-				if err := vpngate.PersistCache(h.cacheDir(), fresh); err != nil {
-					nlog.Core().Debug("vpngate: persist cache failed", "error", err)
-				}
+			if rows, _, err := h.sub.Fetch(false); err == nil && len(rows) > 0 {
+				_ = vpngate.PersistCache(h.store.Dir(), rows)
 			}
 		}
 	}
+}
+
+// applyInitialRetrying walks candidates until one connects.
+func (h *HealthLoop) ApplyInitialRetrying(first vpngate.Row, rows []vpngate.Row) error {
+	r := first
+	for attempt := 0; attempt < 10; attempt++ {
+		err := h.connect(r)
+		if err == nil {
+			h.mu.Lock()
+			h.current = &Current{Row: r, ChangedAt: time.Now()}
+			h.mu.Unlock()
+			if h.vg != nil {
+				h.vg.Set(r)
+			}
+			h.markUsed(r.Key())
+			nlog.Core().Info("vpngate: node selected", "why", "initial", "node", r.LogSummary())
+			return nil
+		}
+		h.markUsed(r.Key()) // don't bounce between the same failures
+		nlog.Core().Warn("vpngate: connect failed, trying next candidate", "node", r.LogSummary(), "error", err)
+		next, ok := h.pickNext(rows, r.Key())
+		if !ok {
+			return fmt.Errorf("no more candidates")
+		}
+		r = next
+	}
+	return fmt.Errorf("all candidates failed")
 }
 
 func (h *HealthLoop) lastFetch() time.Time {
@@ -345,56 +353,29 @@ func (h *HealthLoop) lastFetch() time.Time {
 	return at
 }
 
-// cacheDir derives the cache location from the store path (egress.json dir).
-func (h *HealthLoop) cacheDir() string {
-	return dirOf(h.store.Path())
-}
-
-func dirOf(p string) string {
-	i := strings.LastIndexByte(p, '/')
-	if i < 0 {
-		return "."
-	}
-	return p[:i]
-}
-
-// probeOnce dials the probe URL through the kernel's internal SOCKS inbound
-// and folds the result into health state.
+// probeOnce dials the probe URL through the local SOCKS proxy (bound to the
+// tunnel device) and folds the result into health state.
 func (h *HealthLoop) probeOnce(ctx context.Context) {
-	h.mu.Lock()
-	kh := h.kernel
-	h.mu.Unlock()
-	if kh == nil || kh.ProbeAddr == "" || kh.ProbeDial == nil {
-		return
-	}
-	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	info, ok := probeVia(cctx, kh)
+	info, ok := probeVia(cctx, vpngate.ProxyPort)
 	if !ok {
 		h.SetProbeResult(false, nil)
 		return
 	}
 	h.SetProbeResult(true, info)
 	if h.degraded(*info) {
-		h.Switch("node degraded (no longer residential / fraud too high)")
+		h.Switch("node degraded (fraud too high / not residential)")
 	}
 }
 
-func probeVia(ctx context.Context, kh *KernelHandle) (*ExitInfo, bool) {
+func probeVia(ctx context.Context, proxyPort int) (*ExitInfo, bool) {
 	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return kh.ProbeDial(ctx, network, addr)
+		Proxy: func(*http.Request) (*url.URL, error) {
+			return url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", proxyPort))
 		},
-		// The SOCKS inbound resolves domains; keep proxying hostnames.
-		Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
 	}
-	// Wrap with SOCKS5 handshake via x/net/proxy equivalent: our probe dialer
-	// already performs the SOCKS handshake (kernel-provided), so the transport
-	// must dial absolute URLs through it — but Go's http.Transport dials the
-	// *request host*. The kernel handle's dialer is bound to the SOCKS inbound
-	// and performs the handshake per-connection with the target address, which
-	// is exactly what transport needs.
-	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+	client := &http.Client{Transport: tr, Timeout: 20 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ProbeURL, nil)
 	if err != nil {
 		return nil, false
@@ -413,9 +394,9 @@ func probeVia(ctx context.Context, kh *KernelHandle) (*ExitInfo, bool) {
 }
 
 // Sorting helper for the panel's node list.
-func SortLinksBySpeed(links []vpngate.Link) []vpngate.Link {
-	out := make([]vpngate.Link, len(links))
-	copy(out, links)
+func SortRowsBySpeed(rows []vpngate.Row) []vpngate.Row {
+	out := make([]vpngate.Row, len(rows))
+	copy(out, rows)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].SpeedMbps > out[j].SpeedMbps })
 	return out
 }
@@ -424,7 +405,6 @@ func SortLinksBySpeed(links []vpngate.Link) []vpngate.Link {
 func RandomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		// crypto/rand failure is effectively unreachable; fall back to time.
 		return fmt.Sprintf("%x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)

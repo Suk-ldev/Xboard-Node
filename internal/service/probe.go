@@ -32,10 +32,12 @@ func vpngateMode(cfg *config.Config) egress.VpngateMode {
 	return egress.VpngateOff
 }
 
-// vpngateSource builds the subscription source seed from config/env.
+// vpngateSource builds the server-list source seed from config/env.
+// ResidentialOnly defaults to true (fanout semantics: home-broadband only)
+// unless the operator explicitly configured it false.
 func vpngateSource(cfg *config.Config) vpngate.Source {
 	if cfg.Vpngate == nil {
-		return vpngate.Source{}
+		return vpngate.Source{ResidentialOnly: true}
 	}
 	return cfg.Vpngate.Source
 }

@@ -22,7 +22,6 @@ import (
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/cedar2025/xboard-node/internal/nlog"
-	"github.com/cedar2025/xboard-node/internal/vpngate"
 	"github.com/cedar2025/xboard-node/internal/warp"
 )
 
@@ -39,10 +38,6 @@ type SingBox struct {
 	cfg config.KernelConfig
 	// warp is the WARP egress account, set before Start when warp is enabled.
 	warp *warp.Account
-	// vpngate is the residential-exit selection, set before Start when the
-	// vpngate egress is enabled. May hold a nil link until the health loop
-	// picks a node; the outbound is generated only when a link exists.
-	vpngate *vpngate.Egress
 
 	mu     sync.RWMutex
 	box    *box.Box
@@ -81,13 +76,6 @@ func (s *SingBox) SetWarpAccount(acc *warp.Account) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.warp = acc
-}
-
-// SetVpngate injects the residential-exit selection before Start/Reload.
-func (s *SingBox) SetVpngate(vg *vpngate.Egress) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.vpngate = vg
 }
 
 // warpModeName returns the routing mode implied by the account ("all": WARP
@@ -129,7 +117,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls, s.warp, warpModeName(s.warp), s.vpngate)
+	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls, s.warp, warpModeName(s.warp))
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -236,7 +224,7 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		return fmt.Errorf("not running")
 	}
 
-	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls, s.warp, warpModeName(s.warp), s.vpngate)
+	cfgMap := buildConfig(s.cfg, nodeConfig, users, tls, s.warp, warpModeName(s.warp))
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -558,7 +546,7 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 // reloadInboundsLocked hot-swaps inbound users using UpdatableInbound.
 // Must be called with s.mu held.
 func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
-	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.tls, s.warp, warpModeName(s.warp), s.vpngate)
+	cfgMap := buildConfig(s.cfg, s.nodeConfig, users, s.tls, s.warp, warpModeName(s.warp))
 	data, err := json.Marshal(cfgMap)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)

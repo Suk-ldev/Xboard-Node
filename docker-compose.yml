@@ -17,6 +17,11 @@ services:
     image: ghcr.io/suk-ldev/xboard-node:latest
     container_name: xboard-node
     network_mode: host
+    # vpngate OpenVPN egress needs the tun device + NET_ADMIN
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
     restart: unless-stopped
     environment:
       API_HOST: ${API_HOST:?set API_HOST in .env}

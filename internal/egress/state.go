@@ -1,14 +1,15 @@
 // Package egress owns the combined egress-policy state: WARP mode plus the
-// vpngate home-broadband outbound, their persistence (egress.json) and the
-// health-check loop that switches vpngate nodes when the exit degrades.
+// vpngate home-broadband exit (OpenVPN runner model), their persistence
+// (egress.json) and the health-check loop that switches nodes when the exit
+// degrades.
 //
 // Modes (Warp × Vpngate):
 //
 //	warp off    + vg off    → direct (plain node, unchanged behavior)
 //	warp v6     + vg off    → v6 via WARP, v4 direct (existing behavior)
-//	warp off    + vg all    → everything via the vpngate residential exit
-//	warp v6     + vg all    → v4 via vpngate, v6 via WARP (valid combo)
-//	warp all    + anything  → invalid: WARP would swallow the vpngate exit
+//	warp off    + vg all    → v4 user traffic via the OpenVPN tunnel
+//	warp v6     + vg all    → v4 via tunnel, v6 via WARP (valid combo)
+//	warp all    + anything  → invalid: WARP would swallow the tunnel exit
 package egress
 
 import (
@@ -39,15 +40,11 @@ type State struct {
 	WarpMode string `json:"warp_mode"` // off | all | v6
 	// Vpngate selects the residential-exit participation.
 	Vpngate VpngateMode `json:"vpngate"`
-	// VpngateSource holds the subscription filters (URL, residential-only,
-	// fraud ceiling, country allowlist).
+	// VpngateSource holds the server-list URL and filters.
 	VpngateSource vpngate.Source `json:"vpngate_source"`
 	// PinnedNode optionally pins a specific volunteer node (host:port).
 	// Empty = automatic (first healthy candidate).
 	PinnedNode string `json:"pinned_node,omitempty"`
-	// ManualUUID lets the operator supply their own entry UUID; empty uses
-	// the known-good public one.
-	ManualUUID string `json:"manual_uuid,omitempty"`
 	// Admin holds the generated panel credentials (path + password hash).
 	Admin AdminState `json:"admin"`
 	// UpdatedAt is the last write time (informational).
@@ -59,9 +56,7 @@ type AdminState struct {
 	// BasePath is the secret URL prefix (e.g. "/x7f2a…/"); requests outside
 	// it get a 404. Empty on first boot until the panel is initialized.
 	BasePath string `json:"base_path,omitempty"`
-	// PasswordHash is scrypt/bcrypt-style "salt:hash" hex; empty = auth
-	// disabled (panel GET-only until first login sets a password? no —
-	// first boot generates one and logs it).
+	// PasswordHash is "salt:hash" hex; empty until first boot generates one.
 	PasswordHash string `json:"password_hash,omitempty"`
 }
 
@@ -78,7 +73,7 @@ func (s *State) Validate() error {
 		return fmt.Errorf("vpngate must be off/all, got %q", s.Vpngate)
 	}
 	if s.WarpMode == "all" && s.Vpngate == VpngateAll {
-		return errors.New("warp.mode=all cannot be combined with vpngate=all: WARP would swallow the residential exit; use warp v6 + vpngate all instead")
+		return errors.New("warp.mode=all cannot be combined with vpngate=all: WARP would swallow the tunnel exit; use warp v6 + vpngate all instead")
 	}
 	if s.Vpngate == VpngateAll {
 		if strings.TrimSpace(s.VpngateSource.URL) == "" {
@@ -91,7 +86,7 @@ func (s *State) Validate() error {
 // WarpEnabled reports whether the WARP endpoint must be generated.
 func (s *State) WarpEnabled() bool { return s.WarpMode == "all" || s.WarpMode == "v6" }
 
-// VpngateEnabled reports whether the residential outbound must be generated.
+// VpngateEnabled reports whether the residential exit must run.
 func (s *State) VpngateEnabled() bool { return s.Vpngate == VpngateAll }
 
 // Store persists State at <dir>/egress.json with atomic rename.
@@ -106,6 +101,9 @@ func NewStore(dir string) *Store {
 
 // Path exposes the backing file (admin panel display).
 func (s *Store) Path() string { return s.path }
+
+// Dir returns the directory holding the state file.
+func (s *Store) Dir() string { return filepath.Dir(s.path) }
 
 func (s *Store) Load() (*State, error) {
 	s.mu.Lock()

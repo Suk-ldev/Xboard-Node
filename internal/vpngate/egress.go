@@ -2,44 +2,39 @@ package vpngate
 
 import "sync"
 
-// Egress is the resolved vpngate selection handed to the kernel builders.
-// It carries the active link plus the UUID to present at the entry.
+// Egress is the resolved vpngate selection handed to the service. With the
+// OpenVPN runner model the kernel no longer consumes it (the kernel keeps a
+// plain direct/final route); the health loop and admin panel do.
 type Egress struct {
 	mu   sync.Mutex
-	link *Link
-	uuid string
+	row  *Row
+	uuid string // unused in ovpn mode; kept for state compatibility
 }
 
 func NewEgress(uuid string) *Egress { return &Egress{uuid: uuid} }
 
-// Set atomically swaps the active link (health loop / admin panel).
-func (e *Egress) Set(l Link) {
+// Set atomically swaps the active row (health loop / admin panel).
+func (e *Egress) Set(r Row) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	clone := l
-	e.link = &clone
+	clone := r
+	e.row = &clone
 }
 
-// Link returns the active link (nil when none selected yet).
-func (e *Egress) Link() *Link {
+// Row returns the active row copy (nil when none selected yet).
+func (e *Egress) Row() *Row {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.link == nil {
+	if e.row == nil {
 		return nil
 	}
-	clone := *e.link
+	clone := *e.row
 	return &clone
 }
 
-// UUID returns the entry UUID override ("" = RealUUID).
+// UUID returns the stored UUID override ("" = default; unused in ovpn mode).
 func (e *Egress) UUID() string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.uuid
 }
-
-// ProbePort is the loopback port of the internal health-probe SOCKS inbound.
-// Fixed (not config) because it must never collide with node listen ports,
-// which are panel-controlled and can be anything; 64500-65500 is reserved by
-// convention here and validated against the panel port in validateNodeRuntime.
-const ProbePort = 64510

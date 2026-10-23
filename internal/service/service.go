@@ -198,22 +198,13 @@ func (s *Service) Run(ctx context.Context) error {
 		nlog.Core().Info("vpngate egress enabled",
 			"source", kit.state.VpngateSource.URL,
 			"residential_only", kit.state.VpngateSource.ResidentialOnly,
-			"probe_port", vpngate.ProbePort,
+			"proxy_port", vpngate.ProxyPort,
+			"mode", "openvpn",
 		)
-		// Select the initial node BEFORE the kernel starts: the vpngate
-		// outbound (and probe inbound) only get generated when a link is
-		// present, and sing-box cannot add outbounds on hot reload.
-		kit.selectInitialNode()
-		// Health loop drives subsequent selection + switching; each switch
-		// forces a kernel restart (outbound lists are fixed per instance).
-		kit.onSwitch = func() {
-			s.egressReloadMu.Lock()
-			defer s.egressReloadMu.Unlock()
-			if s.lastConfig != nil && len(s.lastUsers) > 0 {
-				s.startKernel(s.lastConfig, s.lastUsers)
-			}
-		}
-		kit.startHealthLoop(ctx, s.kernel)
+		// OpenVPN model: the tunnel is independent of the kernel. Node
+		// switches restart the openvpn child only — no kernel reload.
+		kit.onSwitch = func() {}
+		kit.startVpngate(ctx)
 	}
 	kit.notifyPanel()
 

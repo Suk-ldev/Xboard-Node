@@ -18,14 +18,14 @@ func TestValidateCombinations(t *testing.T) {
 		{"off", "all", true}, // url filled below
 		{"v6", "all", true},
 		{"all", "off", true},
-		{"all", "all", false}, // WARP would swallow the residential exit
+		{"all", "all", false}, // WARP would swallow the tunnel exit
 		{"bogus", "off", false},
 		{"off", "bogus", false},
 	}
 	for _, c := range cases {
 		st := &State{WarpMode: c.warp, Vpngate: VpngateMode(c.vg)}
 		if c.vg == "all" {
-			st.VpngateSource.URL = DefaultProbeTestURL
+			st.VpngateSource.URL = DefaultTestURL
 		}
 		err := st.Validate()
 		if c.ok && err != nil {
@@ -37,18 +37,18 @@ func TestValidateCombinations(t *testing.T) {
 	}
 }
 
+const DefaultTestURL = "https://example.com/api"
+
 func TestValidateVpngateNeedsURL(t *testing.T) {
 	st := &State{WarpMode: "off", Vpngate: VpngateAll}
 	if err := st.Validate(); err == nil || !strings.Contains(err.Error(), "url") {
 		t.Errorf("expected url error, got %v", err)
 	}
-	st.VpngateSource.URL = DefaultProbeTestURL
+	st.VpngateSource.URL = DefaultTestURL
 	if err := st.Validate(); err != nil {
 		t.Errorf("with url: %v", err)
 	}
 }
-
-const DefaultProbeTestURL = "https://example.com/sub.txt"
 
 func TestStoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -57,7 +57,7 @@ func TestStoreRoundTrip(t *testing.T) {
 		WarpMode: "v6",
 		Vpngate:  VpngateAll,
 		VpngateSource: vpngate.Source{
-			URL:             DefaultProbeTestURL,
+			URL:             DefaultTestURL,
 			ResidentialOnly: true,
 			MaxFraudScore:   25,
 			Countries:       []string{"Japan"},
@@ -84,18 +84,18 @@ func TestStoreRoundTrip(t *testing.T) {
 
 func TestPickInitialSkipsUsedRing(t *testing.T) {
 	st := &State{WarpMode: "off", Vpngate: VpngateAll, VpngateSource: vpngate.Source{URL: "x"}}
-	h := NewHealthLoop(st, NewStore(t.TempDir()), vpngate.NewManager(st.VpngateSource), vpngate.NewEgress(""), &KernelHandle{})
-	links := []vpngate.Link{
-		{NodeHost: "a.opengw.net", NodePort: 1},
-		{NodeHost: "b.opengw.net", NodePort: 2},
+	h := NewHealthLoop(st, NewStore(t.TempDir()), vpngate.NewManager(st.VpngateSource), nil, nil, vpngate.NewEgress(""))
+	rows := []vpngate.Row{
+		{Host: "a.opengw.net", IP: "1.2.3.4", Port: 1},
+		{Host: "b.opengw.net", IP: "5.6.7.8", Port: 2},
 	}
-	l1, ok := h.PickInitial(links)
-	if !ok || l1.NodeHost != "a.opengw.net" {
-		t.Fatalf("first pick = %+v ok=%v", l1, ok)
+	r1, ok := h.PickInitial(rows)
+	if !ok || r1.Host != "a.opengw.net" {
+		t.Fatalf("first pick = %+v ok=%v", r1, ok)
 	}
-	h.markUsed("a.opengw.net:1")
-	l2, ok := h.PickInitial(links)
-	if !ok || l2.NodeHost != "b.opengw.net" {
-		t.Fatalf("second pick should skip used: %+v ok=%v", l2, ok)
+	h.markUsed(r1.Key())
+	r2, ok := h.PickInitial(rows)
+	if !ok || r2.Host != "b.opengw.net" {
+		t.Fatalf("second pick should skip used: %+v ok=%v", r2, ok)
 	}
 }

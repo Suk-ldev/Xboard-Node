@@ -19,7 +19,8 @@ RUN CGO_ENABLED=0 go build -ldflags "-s -w \
 # Runtime stage — sing-box & xray-core are embedded as Go libraries
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata openvpn iproute2 && \
+    ln -s /sbin/openvpn /usr/sbin/openvpn 2>/dev/null || true
 
 COPY --from=builder /build/xboard-node /usr/local/bin/xboard-node
 
@@ -57,6 +58,10 @@ WORKDIR /etc/xboard-node
 #   docker run -d --network=host -v xboard-data:/etc/xboard-node \
 #     -e API_HOST=... -e API_KEY=... -e NODE_ID=1 -e WARP_MODE=all \
 #     ghcr.io/suk-ldev/xboard-node:latest
+#
+# VPNGate residential egress (OpenVPN model) additionally needs:
+#   --device /dev/net/tun --cap-add NET_ADMIN
+# (openvpn is baked into this image; the tun device + NET_ADMIN are host-side)
 
 ENTRYPOINT ["xboard-node"]
 CMD ["-c", "/etc/xboard-node/config.yml"]

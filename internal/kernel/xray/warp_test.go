@@ -26,7 +26,7 @@ func testWarpAccount() *warp.Account {
 func TestBuildConfig_WarpAll(t *testing.T) {
 	kcfg := config.KernelConfig{LogLevel: "info"}
 	nc := &panel.NodeConfig{Protocol: "shadowsocks", ServerPort: 111, Cipher: "aes-128-gcm"}
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, testWarpAccount(), nil)
+	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, testWarpAccount())
 
 	outbounds := cfg["outbounds"].([]M)
 	var warpOut M
@@ -86,7 +86,7 @@ func TestBuildConfig_WarpAll(t *testing.T) {
 func TestBuildConfig_WarpNoAccount(t *testing.T) {
 	kcfg := config.KernelConfig{LogLevel: "info"}
 	nc := &panel.NodeConfig{Protocol: "shadowsocks", ServerPort: 111, Cipher: "aes-128-gcm"}
-	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, nil, nil)
+	cfg := buildConfig(kcfg, testNodeSpec(nc), testUsers, kernel.TLSCert{}, nil)
 
 	for _, ob := range cfg["outbounds"].([]M) {
 		if ob["tag"] == "warp" {
