@@ -300,7 +300,14 @@ func (h *HealthLoop) loop(ctx context.Context) {
 				vpngate.SortBySpeed(rows)
 				if r, ok := h.PickInitial(rows); ok {
 					if err := h.ApplyInitialRetrying(r, rows); err != nil {
-						nlog.Core().Warn("vpngate: initial connect failed", "error", err)
+						// Whole burst failed — the nodes (or our network)
+						// need a cooldown; back off before hammering again.
+						nlog.Core().Warn("vpngate: all candidates failed, backing off 5m", "error", err)
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(5 * time.Minute):
+						}
 					}
 				}
 			} else {

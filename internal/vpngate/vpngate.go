@@ -129,7 +129,7 @@ func (m *Manager) Fetch(staleOK bool) ([]Row, time.Time, error) {
 
 func (m *Manager) fetchOnce() ([]Row, error) {
 	src := m.Source()
-	body, err := HTTPGet(src.URL, 30*time.Second)
+	body, err := HTTPGet(src.URL, 90*time.Second)
 	if err != nil {
 		return nil, err
 	}
